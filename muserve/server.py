@@ -19,11 +19,13 @@ from muserve.distributed import init_distributed, get_tp_rank, barrier
 from muserve.loader import _load_index, load_layer_weights, load_embedding_weights
 from muserve.model.qwen35_model import Qwen35Model
 from muserve.config import DEFAULT_MODEL_PATH, NUM_LAYERS, TP_SIZE, VOCAB_SIZE
+from muserve.inference_loop import InferenceLoop, InferenceRequest
 
 app = Flask(__name__)
 model: Qwen35Model = None
 tokenizer = None
 device = None
+inference_loop: InferenceLoop = None
 
 
 def load_model(model_path: str):
@@ -67,57 +69,34 @@ def generate_stream(
 ) -> Generator[str, None, None]:
     """流式生成 token，yield SSE 格式的 JSON chunk。
 
-    cache_prefix_len: 缓存前缀长度。>0 时启用 Prefix Cache。
+    通过 InferenceLoop 提交请求，从 result_queue 读取流式 token。
     """
     rank = get_tp_rank()
     request_id = str(uuid.uuid4())[:8]
 
-    ids_tensor = torch.tensor(input_ids, device=device, dtype=torch.long)
-    cu_seqlens = torch.tensor([0, len(input_ids)], device=device, dtype=torch.int64)
-
-    # Prefill (with Prefix Cache support)
-    logits, gdn_states = model.forward_prefill(
-        ids_tensor, cu_seqlens, cache_prefix_len=cache_prefix_len,
+    req = InferenceRequest(
+        request_id=request_id,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        cache_prefix_len=cache_prefix_len,
     )
+    inference_loop.submit_request(req)
 
-    # Sample first token
-    if temperature <= 0:
-        next_token = model.greedy_sample(logits)
-    else:
-        next_token = model.greedy_sample(logits)  # TODO: temperature sampling
-
-    generated = [next_token.item()]
-
-    if rank == 0:
-        token_text = tokenizer.decode([next_token.item()], skip_special_tokens=False)
-        chunk = _make_chunk(request_id, token_text)
-        yield f"data: {json.dumps(chunk)}\n\n"
-
-    # Decode loop
-    for step in range(max_new_tokens - 1):
-        decode_ids = next_token.unsqueeze(0).unsqueeze(0)  # [1, 1]
-        logits, gdn_states = model.forward_decode(decode_ids, gdn_states)
-
-        if temperature <= 0:
-            next_token = model.greedy_sample(logits)
-        else:
-            next_token = model.greedy_sample(logits)
-
-        token_id = next_token.item()
-        generated.append(token_id)
-
-        # EOS check
-        if tokenizer and token_id == tokenizer.eos_token_id:
+    # Read tokens from result queue (blocking)
+    while True:
+        msg_type, payload = req.result_queue.get()
+        if msg_type == "done":
+            if rank == 0:
+                yield f"data: {json.dumps(_make_chunk(request_id, '', finish_reason='stop'))}\n\n"
+                yield "data: [DONE]\n\n"
             break
-
-        if rank == 0:
-            token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-            chunk = _make_chunk(request_id, token_text)
-            yield f"data: {json.dumps(chunk)}\n\n"
-
-    if rank == 0:
-        yield f"data: {json.dumps(_make_chunk(request_id, '', finish_reason='stop'))}\n\n"
-        yield "data: [DONE]\n\n"
+        elif msg_type == "token":
+            token_id = payload
+            if rank == 0:
+                token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+                chunk = _make_chunk(request_id, token_text)
+                yield f"data: {json.dumps(chunk)}\n\n"
 
 
 def _make_chunk(request_id: str, content: str, finish_reason: str = None) -> dict:
@@ -309,17 +288,22 @@ def main():
     load_model(args.model_path)
     load_tokenizer(args.model_path)
 
+    global inference_loop
+    inference_loop = InferenceLoop(model, tokenizer)
+
     barrier()
 
     if rank == 0:
         print(f"[server] Starting API server on port {args.port}")
-        app.run(host="0.0.0.0", port=args.port, threaded=False)
-    else:
-        # Non-rank-0 workers wait for inference requests via broadcast
-        # In eager baseline, all ranks run the same forward pass
-        # Flask only runs on rank 0, other ranks participate via dist collectives
-        while True:
-            time.sleep(1)
+        # Run Flask in a separate daemon thread
+        flask_thread = threading.Thread(
+            target=lambda: app.run(host="0.0.0.0", port=args.port, threaded=True),
+            daemon=True,
+        )
+        flask_thread.start()
+
+    # All ranks run the inference loop (blocks forever)
+    inference_loop.run()
 
 
 if __name__ == "__main__":

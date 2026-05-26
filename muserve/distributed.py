@@ -4,11 +4,13 @@
 """
 
 import os
+import pickle
 import torch
 import torch.distributed as dist
 import torch_musa
 
 _TP_GROUP: dist.ProcessGroup | None = None
+_CPU_GROUP: dist.ProcessGroup | None = None
 _TP_RANK: int = 0
 _TP_SIZE: int = 8
 
@@ -20,8 +22,8 @@ def destroy_distributed() -> None:
 
 
 def init_distributed() -> None:
-    """初始化 torch.distributed，使用 MCCL backend。"""
-    global _TP_GROUP, _TP_RANK, _TP_SIZE
+    """初始化 torch.distributed，使用 MCCL backend + Gloo CPU group。"""
+    global _TP_GROUP, _CPU_GROUP, _TP_RANK, _TP_SIZE
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -39,6 +41,9 @@ def init_distributed() -> None:
 
     _TP_GROUP = dist.group.WORLD
     _TP_RANK = rank
+
+    # Gloo CPU group for broadcasting Python objects (requests, control signals)
+    _CPU_GROUP = dist.new_group(ranks=list(range(world_size)), backend="gloo")
 
 
 def get_tp_rank() -> int:
@@ -66,3 +71,28 @@ def all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor) -> None:
 
 def barrier() -> None:
     dist.barrier(group=_TP_GROUP)
+
+
+def get_cpu_group() -> dist.ProcessGroup:
+    assert _CPU_GROUP is not None, "call init_distributed() first"
+    return _CPU_GROUP
+
+
+def broadcast_pyobj(obj, src: int = 0):
+    """Broadcast a Python object from src rank to all ranks via Gloo CPU group.
+
+    Used for distributing inference requests from rank 0 to all TP workers.
+    """
+    if _TP_RANK == src:
+        data = pickle.dumps(obj)
+        size_tensor = torch.tensor([len(data)], dtype=torch.long)
+        dist.broadcast(size_tensor, src=src, group=_CPU_GROUP)
+        data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+        dist.broadcast(data_tensor, src=src, group=_CPU_GROUP)
+        return obj
+    else:
+        size_tensor = torch.tensor([0], dtype=torch.long)
+        dist.broadcast(size_tensor, src=src, group=_CPU_GROUP)
+        data_tensor = torch.empty(size_tensor.item(), dtype=torch.uint8)
+        dist.broadcast(data_tensor, src=src, group=_CPU_GROUP)
+        return pickle.loads(data_tensor.numpy().tobytes())

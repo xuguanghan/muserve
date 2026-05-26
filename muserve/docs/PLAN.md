@@ -432,11 +432,38 @@ Decode 时 micro-batch=1，pipeline 各 stage 大部分时间在等待，GPU 空
 - [ ] 调优 chunk_gated_delta_rule 的 chunk_size
 - [ ] 检查是否有更优的 kernel 配置
 
-### Task 3.3：Anthropic Messages API
-- [ ] `/v1/messages` + SSE streaming
-- [ ] 连续批处理调度器集成
+### Task 3.3：API 服务化 + 多 Rank 协调
 
-### Task 3.3：CPU KV Cache Offload（可选）
+**已完成**：
+- [x] `/v1/messages` Anthropic SSE streaming 端点
+- [x] `/v1/chat/completions` OpenAI 兼容端点
+- [ ] 多 rank 协调（当前非 rank-0 只是 sleep）
+
+**sglang 多 rank 机制分析**：
+
+sglang 采用"所有 rank 跑同一事件循环"模式（非 master/worker）：
+```
+每个 rank 的事件循环：
+while True:
+    # 同步点：rank 0 从 ZMQ 收请求，broadcast 给所有 rank
+    requests = broadcast_pyobj(recv_reqs, rank, gloo_group, src=0)
+    # 所有 rank 用相同 batch 执行 forward（NCCL all_reduce 自动同步）
+    output = model.forward(batch)
+```
+
+| 机制 | 传输方式 | 用途 |
+|------|----------|------|
+| 请求分发 | `broadcast_pyobj`（Gloo CPU group） | rank 0 → all: 每轮推理请求 |
+| 前向计算 | NCCL `all_reduce` | 模型层内 TP 同步 |
+| 大 payload | 共享内存 ring buffer | 多模态特征等 |
+
+**muserve 实现方案**：
+- [ ] InferenceLoop：所有 rank 共同运行的推理循环
+- [ ] rank 0 额外运行 HTTP server（Flask 在独立线程）
+- [ ] 请求通过 `broadcast_pyobj`（Gloo）分发到所有 rank
+- [ ] 推理结果只在 rank 0 返回给客户端
+
+### Task 3.4：CPU KV Cache Offload（可选）
 - [ ] 超长上下文（128K+）时 LRU 换出到 pinned CPU memory
 
 ---
