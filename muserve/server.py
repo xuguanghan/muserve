@@ -63,16 +63,22 @@ def generate_stream(
     input_ids: list[int],
     max_new_tokens: int = 256,
     temperature: float = 0.0,
+    cache_prefix_len: int = 0,
 ) -> Generator[str, None, None]:
-    """流式生成 token，yield SSE 格式的 JSON chunk。"""
+    """流式生成 token，yield SSE 格式的 JSON chunk。
+
+    cache_prefix_len: 缓存前缀长度。>0 时启用 Prefix Cache。
+    """
     rank = get_tp_rank()
     request_id = str(uuid.uuid4())[:8]
 
     ids_tensor = torch.tensor(input_ids, device=device, dtype=torch.long)
     cu_seqlens = torch.tensor([0, len(input_ids)], device=device, dtype=torch.int64)
 
-    # Prefill
-    logits, gdn_states = model.forward_prefill(ids_tensor, cu_seqlens)
+    # Prefill (with Prefix Cache support)
+    logits, gdn_states = model.forward_prefill(
+        ids_tensor, cu_seqlens, cache_prefix_len=cache_prefix_len,
+    )
 
     # Sample first token
     if temperature <= 0:
@@ -170,6 +176,113 @@ def chat_completions():
                 "finish_reason": "stop",
             }],
         })
+
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API endpoint (/v1/messages) with SSE streaming."""
+    data = request.json
+    messages = data.get("messages", [])
+    max_tokens = data.get("max_tokens", 1024)
+    temperature = data.get("temperature", 0.0)
+    stream = data.get("stream", False)
+    system_prompt = data.get("system", "")
+    model_name = data.get("model", "qwen3.5-397b")
+
+    # Convert Anthropic messages to chat format for tokenizer
+    chat_messages = []
+    if system_prompt:
+        chat_messages.append({"role": "system", "content": system_prompt})
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [b["text"] for b in content if b.get("type") == "text"]
+            content = "\n".join(text_parts)
+        chat_messages.append({"role": msg["role"], "content": content})
+
+    prompt = tokenizer.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer.encode(prompt)
+
+    request_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if stream:
+        return Response(
+            _anthropic_stream(request_id, input_ids, max_tokens, temperature, model_name),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    else:
+        output_text = ""
+        for chunk_str in generate_stream(input_ids, max_tokens, temperature):
+            if chunk_str.startswith("data: [DONE]"):
+                break
+            if chunk_str.startswith("data: "):
+                chunk = json.loads(chunk_str[6:])
+                delta = chunk["choices"][0].get("delta", {})
+                output_text += delta.get("content", "")
+
+        return jsonify({
+            "id": request_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": output_text}],
+            "model": model_name,
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": len(input_ids),
+                "output_tokens": len(tokenizer.encode(output_text)),
+            },
+        })
+
+
+def _anthropic_stream(
+    request_id: str, input_ids: list[int], max_tokens: int, temperature: float, model_name: str
+) -> Generator[str, None, None]:
+    """Generate Anthropic SSE stream events."""
+    rank = get_tp_rank()
+    input_token_count = len(input_ids)
+
+    # message_start
+    if rank == 0:
+        event = {
+            "type": "message_start",
+            "message": {
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model_name,
+                "usage": {"input_tokens": input_token_count, "output_tokens": 0},
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(event)}\n\n"
+
+        # content_block_start
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+    output_tokens = 0
+    for chunk_str in generate_stream(input_ids, max_tokens, temperature):
+        if chunk_str.startswith("data: [DONE]"):
+            break
+        if chunk_str.startswith("data: "):
+            chunk = json.loads(chunk_str[6:])
+            delta = chunk["choices"][0].get("delta", {})
+            text = delta.get("content", "")
+            if text and rank == 0:
+                output_tokens += 1
+                event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}
+                yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
+
+    if rank == 0:
+        # content_block_stop
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+        # message_delta
+        event = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": output_tokens}}
+        yield f"event: message_delta\ndata: {json.dumps(event)}\n\n"
+
+        # message_stop
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 @app.route("/health", methods=["GET"])

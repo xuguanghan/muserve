@@ -43,4 +43,4 @@ CHUNKED_PREFILL_SIZE = 4096       # chunk size for prefill（目标 TTFT 1.5s �
 TILELANG_CACHE_DIR   = "/tmp/muserve_kernel_cache"
 
 # ── 模型路径（容器内）────────────────────────────────────────────────────────
-DEFAULT_MODEL_PATH   = "/data/models/Qwen_Qwen3.5-397B-A17B-FP8"
+DEFAULT_MODEL_PATH   = "/data/models/qwen3.5fp8"

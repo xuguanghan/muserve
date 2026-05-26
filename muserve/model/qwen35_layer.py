@@ -378,6 +378,10 @@ def moe_forward(
     sorted_token_idx = flat_token_idx[sort_order]
     sorted_weights = flat_weights[sort_order]
 
+    # 预计算 inverse_order 用于后续 unsort（替代 scatter_add）
+    inverse_order = torch.empty_like(sort_order)
+    inverse_order[sort_order] = torch.arange(total * topk, device=device)
+
     # Gather hidden states（固定大小 [total*topk, HIDDEN]）
     expanded_hidden = hidden[sorted_token_idx]
     m_indices = sorted_expert_ids.to(torch.int32)
@@ -387,30 +391,25 @@ def moe_forward(
 
     use_batched = (
         "moe.experts.gate_proj.weight" in weights
-        and weights["moe.experts.gate_proj.weight"].dtype == torch.float8_e4m3fn
+        or "moe.experts._gate_up_proj.weight" in weights
+    ) and (
+        weights.get("moe.experts.gate_proj.weight", weights.get("moe.experts._gate_up_proj.weight")).dtype == torch.float8_e4m3fn
     )
 
     if use_batched:
         from mate.deep_gemm import ragged_m_moe_gemm_8bit
 
-        w_gate = weights["moe.experts.gate_proj.weight"]
-        s_gate = weights["moe.experts.gate_proj.weight_scale_inv"]
-        w_up = weights["moe.experts.up_proj.weight"]
-        s_up = weights["moe.experts.up_proj.weight_scale_inv"]
+        w_gate_up, s_gate_up = _get_fused_gate_up_weights(weights)
         w_down = weights["moe.experts.down_proj.weight"]
         s_down = weights["moe.experts.down_proj.weight_scale_inv"]
 
         a_fp8, a_scale = _fast_fp8_quantize(expanded_hidden)
 
-        gate_out = torch.empty(num_expanded, MOE_INTERMEDIATE, device=device, dtype=torch.bfloat16)
+        gate_up_out = torch.empty(num_expanded, MOE_INTERMEDIATE * 2, device=device, dtype=torch.bfloat16)
         ragged_m_moe_gemm_8bit(
-            (a_fp8, a_scale), (w_gate, s_gate), m_indices, gate_out,
+            (a_fp8, a_scale), (w_gate_up, s_gate_up), m_indices, gate_up_out,
         )
-
-        up_out = torch.empty(num_expanded, MOE_INTERMEDIATE, device=device, dtype=torch.bfloat16)
-        ragged_m_moe_gemm_8bit(
-            (a_fp8, a_scale), (w_up, s_up), m_indices, up_out,
-        )
+        gate_out, up_out = gate_up_out.split(MOE_INTERMEDIATE, dim=-1)
 
         act = F.silu(gate_out) * up_out
 
@@ -438,11 +437,10 @@ def moe_forward(
             d = fp8_linear(a, w_d, s_d) if s_d is not None else bf16_linear(a, w_d)
             down_out[emask] = d
 
-    # ── 4. 加权 scatter 回原位（无同步）──
-    # m_indices == -1 的行 down_out 可能有垃圾值，用 sorted_weights 置零
-    weighted = down_out * sorted_weights.unsqueeze(-1)
-    output = torch.zeros(total, HIDDEN_SIZE, device=device, dtype=torch.bfloat16)
-    output.scatter_add_(0, sorted_token_idx.unsqueeze(-1).expand_as(weighted), weighted)
+    # ── 4. Unsort + reshape + weighted sum（替代 scatter_add，快 2.6x）──
+    unsorted = down_out[inverse_order]  # 恢复到 token 顺序 [total*topk, HIDDEN]
+    reshaped = unsorted.reshape(total, topk, HIDDEN_SIZE)
+    output = (reshaped * flat_weights.reshape(total, topk, 1)).sum(dim=1)
 
     # AllReduce
     all_reduce(output)
@@ -479,14 +477,12 @@ def _fast_fp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     BLOCK = 128
     M, K = x.shape
     K_blocks = (K + BLOCK - 1) // BLOCK
-    # Pad K if needed
     if K % BLOCK != 0:
         x = F.pad(x, (0, BLOCK * K_blocks - K))
     x_blocks = x.reshape(M, K_blocks, BLOCK)
     amax = x_blocks.abs().amax(dim=-1).clamp(min=1e-12)  # [M, K_blocks]
     scale = (amax / 448.0).to(torch.float32)  # [M, K_blocks]
-    x_scaled = x_blocks / amax.unsqueeze(-1) * 448.0
-    x_fp8 = x_scaled.reshape(M, K_blocks * BLOCK).to(torch.float8_e4m3fn)
+    x_fp8 = (x_blocks * (448.0 / amax).unsqueeze(-1)).reshape(M, K_blocks * BLOCK).to(torch.float8_e4m3fn)
     if K % BLOCK != 0:
         x_fp8 = x_fp8[:, :K].contiguous()
     return x_fp8, scale

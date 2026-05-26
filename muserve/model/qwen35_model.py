@@ -9,6 +9,7 @@ from muserve.config import (
 )
 from muserve.distributed import all_gather_into_tensor, get_tp_rank
 from muserve.model.qwen35_layer import rms_norm, layer_forward_decode, layer_forward_prefill
+from muserve.model.prefix_cache import PrefixCache
 
 
 def _init_gdn_states(
@@ -39,6 +40,7 @@ class Qwen35Model:
         self.embed_weights = embed_weights
         self.layer_weights = layer_weights
         self.rank = get_tp_rank()
+        self.prefix_cache = PrefixCache(max_entries=64, storage="cpu")
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Token embedding。input_ids: [B, T] → [B, T, HIDDEN]。"""
@@ -88,21 +90,58 @@ class Qwen35Model:
         self,
         input_ids: torch.Tensor,        # [total_tokens]
         cu_seqlens: torch.Tensor,       # [num_seqs+1] int64
+        cache_prefix_len: int = 0,      # 缓存前缀长度（0=不缓存）
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Prefill forward。返回 (logits [num_seqs, VOCAB/TP], final_gdn_states)。"""
-        hidden = self.embed(input_ids.unsqueeze(0)).squeeze(0)  # [total, HIDDEN]
+        """Prefill forward with prefix cache support.
 
-        gdn_states = []
-        for i in range(len(self.layer_weights)):
-            hidden, final_state = layer_forward_prefill(
-                hidden, cu_seqlens, self.layer_weights[i],
-            )
-            gdn_states.append(final_state)
+        If cache_prefix_len > 0, will cache state at that position.
+        Automatically checks for cached prefix to skip computation.
+        """
+        device = input_ids.device
+        total_tokens = len(input_ids)
+
+        # Check prefix cache
+        cache_hit = self.prefix_cache.lookup(input_ids, device)
+        if cache_hit is not None:
+            prefix_len, cached_hidden, cached_gdn_states = cache_hit
+            suffix_ids = input_ids[prefix_len:]
+            if len(suffix_ids) == 0:
+                hidden = cached_hidden
+                gdn_states = cached_gdn_states
+            else:
+                suffix_hidden = self.embed(suffix_ids.unsqueeze(0)).squeeze(0)
+                hidden = suffix_hidden
+                suffix_cu = torch.tensor([0, len(suffix_ids)], device=device, dtype=torch.int64)
+                gdn_states = []
+                for i in range(len(self.layer_weights)):
+                    initial_state = cached_gdn_states[i] if cached_gdn_states[i] is not None else None
+                    hidden, final_state = layer_forward_prefill(
+                        hidden, suffix_cu, self.layer_weights[i],
+                        initial_gdn_state=initial_state,
+                    )
+                    gdn_states.append(final_state)
+        else:
+            hidden = self.embed(input_ids.unsqueeze(0)).squeeze(0)
+            gdn_states = []
+            for i in range(len(self.layer_weights)):
+                hidden, final_state = layer_forward_prefill(
+                    hidden, cu_seqlens, self.layer_weights[i],
+                )
+                gdn_states.append(final_state)
+
+            # Store to cache if requested
+            if cache_prefix_len > 0 and cache_prefix_len <= total_tokens:
+                self.prefix_cache.store(
+                    input_ids, cache_prefix_len, hidden, gdn_states,
+                )
 
         # 取每个序列最后一个 token 的 hidden 做 lm_head
-        last_positions = cu_seqlens[1:] - 1  # [num_seqs]
-        last_hidden = hidden[last_positions]  # [num_seqs, HIDDEN]
-        logits = self.lm_head(last_hidden)    # [num_seqs, VOCAB/TP]
+        if cache_hit is not None and len(suffix_ids) > 0:
+            last_hidden = hidden[-1:].unsqueeze(0).squeeze(0)
+        else:
+            last_positions = cu_seqlens[1:] - 1
+            last_hidden = hidden[last_positions]
+        logits = self.lm_head(last_hidden)
         return logits, gdn_states
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
