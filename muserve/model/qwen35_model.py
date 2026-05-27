@@ -1,15 +1,28 @@
 """Qwen3.5-397B 完整模型 forward（60 层）。"""
 
+import os
 import torch
 import torch_musa
 
 from muserve.config import (
     NUM_LAYERS, HIDDEN_SIZE, VOCAB_SIZE, TP_SIZE,
-    GDN_NUM_V_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM,
+    GDN_NUM_V_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM, GDN_CONV_KERNEL,
 )
 from muserve.distributed import all_gather_into_tensor, get_tp_rank
-from muserve.model.qwen35_layer import rms_norm, layer_forward_decode, layer_forward_prefill
 from muserve.model.prefix_cache import PrefixCache
+
+_USE_V2 = os.environ.get("MUSERVE_LAYER_V2", "1") == "1"
+
+if _USE_V2:
+    from muserve.model.qwen35_layer_v2 import (
+        rms_norm_gemma as rms_norm,
+        layer_forward_decode,
+        layer_forward_prefill,
+        _QKV_DIM_LOCAL,
+    )
+else:
+    from muserve.model.qwen35_layer import rms_norm, layer_forward_decode, layer_forward_prefill
+    _QKV_DIM_LOCAL = None
 
 
 def _init_gdn_states(
@@ -22,6 +35,16 @@ def _init_gdn_states(
             batch_size, GDN_NUM_V_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM,
             device=device, dtype=torch.float32,
         )
+        for _ in range(NUM_LAYERS)
+    ]
+
+
+def _init_conv_states(device: torch.device) -> list[torch.Tensor | None]:
+    """初始化所有层的 conv state (v2 only)。GDN 层有 conv state，Attention 层为 None。"""
+    if not _USE_V2 or _QKV_DIM_LOCAL is None:
+        return [None] * NUM_LAYERS
+    return [
+        torch.zeros(_QKV_DIM_LOCAL, GDN_CONV_KERNEL - 1, device=device, dtype=torch.bfloat16)
         for _ in range(NUM_LAYERS)
     ]
 
@@ -73,32 +96,47 @@ class Qwen35Model:
         input_ids: torch.Tensor,        # [B, 1]
         gdn_states: list[torch.Tensor], # NUM_LAYERS × [B, V_heads, V_dim, K_dim]
         kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor] | None]]:
-        """Decode step forward。返回 (logits, new_gdn_states, new_kv_caches)。"""
+        conv_states: list[torch.Tensor | None] | None = None,
+        positions: torch.Tensor | None = None,  # [B] int64, 当前 decode step 的绝对位置
+    ) -> tuple:
+        """Decode step forward。返回 (logits, new_gdn_states, new_kv_caches, new_conv_states)。"""
         hidden = self.embed(input_ids)  # [B, 1, HIDDEN]
 
         new_states = []
         new_kv_caches = []
+        new_conv_states = []
         for i in range(len(self.layer_weights)):
             past_kv = kv_caches[i] if kv_caches is not None else None
-            hidden, new_state, new_kv = layer_forward_decode(
-                hidden, gdn_states[i], self.layer_weights[i], kv_cache=past_kv
-            )
+            conv_st = conv_states[i] if conv_states is not None else None
+            if _USE_V2:
+                hidden, new_state, new_kv, new_conv = layer_forward_decode(
+                    hidden, gdn_states[i], self.layer_weights[i],
+                    kv_cache=past_kv, conv_state=conv_st, positions=positions,
+                )
+            else:
+                hidden, new_state, new_kv = layer_forward_decode(
+                    hidden, gdn_states[i], self.layer_weights[i], kv_cache=past_kv
+                )
+                new_conv = conv_st
             new_states.append(new_state)
             new_kv_caches.append(new_kv)
+            new_conv_states.append(new_conv)
 
         logits = self.lm_head(hidden[:, -1, :])  # [B, VOCAB/TP]
-        return logits, new_states, new_kv_caches
+        return logits, new_states, new_kv_caches, new_conv_states
 
     def forward_prefill(
         self,
         input_ids: torch.Tensor,        # [total_tokens]
         cu_seqlens: torch.Tensor,       # [num_seqs+1] int64
         cache_prefix_len: int = 0,      # 缓存前缀长度（0=不缓存）
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor] | None]]:
-        """Prefill forward. 返回 (logits, gdn_states, kv_caches)。"""
+    ) -> tuple:
+        """Prefill forward. 返回 (logits, gdn_states, kv_caches, conv_states)。"""
         device = input_ids.device
         total_tokens = len(input_ids)
+
+        # Build positions tensor: per-sequence position indices
+        positions = self._build_positions(cu_seqlens, device)
 
         # Check prefix cache
         cache_hit = self.prefix_cache.lookup(input_ids, device)
@@ -109,31 +147,52 @@ class Qwen35Model:
                 hidden = cached_hidden
                 gdn_states = cached_gdn_states
                 kv_caches = [None] * len(self.layer_weights)
+                conv_states = _init_conv_states(device)
             else:
                 suffix_hidden = self.embed(suffix_ids.unsqueeze(0)).squeeze(0)
                 hidden = suffix_hidden
                 suffix_cu = torch.tensor([0, len(suffix_ids)], device=device, dtype=torch.int64)
+                suffix_positions = torch.arange(prefix_len, prefix_len + len(suffix_ids), device=device)
                 gdn_states = []
                 kv_caches = []
+                conv_states = []
                 for i in range(len(self.layer_weights)):
                     initial_state = cached_gdn_states[i] if cached_gdn_states[i] is not None else None
-                    hidden, final_state, new_kv = layer_forward_prefill(
-                        hidden, suffix_cu, self.layer_weights[i],
-                        initial_gdn_state=initial_state,
-                    )
+                    if _USE_V2:
+                        hidden, final_state, new_kv, new_conv = layer_forward_prefill(
+                            hidden, suffix_cu, self.layer_weights[i],
+                            initial_gdn_state=initial_state,
+                            positions=suffix_positions,
+                        )
+                    else:
+                        hidden, final_state, new_kv = layer_forward_prefill(
+                            hidden, suffix_cu, self.layer_weights[i],
+                            initial_gdn_state=initial_state,
+                        )
+                        new_conv = None
                     gdn_states.append(final_state)
                     kv_caches.append(new_kv)
+                    conv_states.append(new_conv)
         else:
             hidden = self.embed(input_ids.unsqueeze(0)).squeeze(0)
             gdn_states = []
             kv_caches = []
+            conv_states = []
             for i in range(len(self.layer_weights)):
-                hidden, final_state, new_kv = layer_forward_prefill(
-                    hidden, cu_seqlens, self.layer_weights[i],
-                    layer_idx=i,
-                )
+                if _USE_V2:
+                    hidden, final_state, new_kv, new_conv = layer_forward_prefill(
+                        hidden, cu_seqlens, self.layer_weights[i],
+                        positions=positions,
+                    )
+                else:
+                    hidden, final_state, new_kv = layer_forward_prefill(
+                        hidden, cu_seqlens, self.layer_weights[i],
+                        layer_idx=i,
+                    )
+                    new_conv = None
                 gdn_states.append(final_state)
                 kv_caches.append(new_kv)
+                conv_states.append(new_conv)
 
             # Store to cache if requested
             if cache_prefix_len > 0 and cache_prefix_len <= total_tokens:
@@ -150,10 +209,16 @@ class Qwen35Model:
         logits = self.lm_head(last_hidden)
 
         # Reshape attention KV cache from flat [total, H, D] to per-batch [B, S, H, D].
-        # Requires equal-length sequences (cu_seqlens with constant stride).
         kv_caches = self._reshape_kv_caches_for_decode(kv_caches, cu_seqlens)
 
-        return logits, gdn_states, kv_caches
+        return logits, gdn_states, kv_caches, conv_states
+
+    @staticmethod
+    def _build_positions(cu_seqlens: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Build per-token position indices from cu_seqlens."""
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        positions = torch.cat([torch.arange(s, device=device) for s in seqlens.tolist()])
+        return positions
 
     @staticmethod
     def _reshape_kv_caches_for_decode(kv_caches, cu_seqlens):

@@ -8,10 +8,15 @@
     graphed.step()
 """
 
+import os
 import torch
 import torch_musa
 
-from muserve.model.qwen35_layer import layer_forward_decode
+_USE_V2 = os.environ.get("MUSERVE_LAYER_V2", "1") == "1"
+if _USE_V2:
+    from muserve.model.qwen35_layer_v2 import layer_forward_decode
+else:
+    from muserve.model.qwen35_layer import layer_forward_decode
 from muserve.distributed import all_reduce
 
 
@@ -85,9 +90,17 @@ class GraphedDecodeStep:
         hidden = self.model.embed(input_ids)  # [B, 1, HIDDEN]
 
         for i in range(len(self.model.layer_weights)):
-            hidden, _, _ = layer_forward_decode(
-                hidden, gdn_states[i], self.model.layer_weights[i]
-            )
+            if _USE_V2:
+                # v2 layer 返回 4 元组 (hidden, gdn_state, kv_cache, conv_state)
+                # graph capture 不支持 attention KV cache 和 conv state（变长 tensor）
+                # 这里只用于 GDN-only 的 graph 验证；attn 层需要在外部处理
+                hidden, _, _, _ = layer_forward_decode(
+                    hidden, gdn_states[i], self.model.layer_weights[i]
+                )
+            else:
+                hidden, _, _ = layer_forward_decode(
+                    hidden, gdn_states[i], self.model.layer_weights[i]
+                )
 
         logits = self.model.lm_head(hidden[:, -1, :])  # [B, VOCAB/TP]
         self._logits_buf = logits

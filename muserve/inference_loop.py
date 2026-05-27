@@ -100,7 +100,7 @@ class InferenceLoop:
         cu_seqlens = torch.tensor([0, len(input_ids)], device=self.device, dtype=torch.int64)
 
         # Prefill
-        logits, gdn_states, kv_caches = self.model.forward_prefill(
+        logits, gdn_states, kv_caches, conv_states = self.model.forward_prefill(
             ids_tensor, cu_seqlens, cache_prefix_len=payload.cache_prefix_len,
         )
 
@@ -115,12 +115,18 @@ class InferenceLoop:
             self._send_token(payload.request_id, token_id)
 
         # Decode loop
+        prompt_len = len(input_ids)
         for step in range(payload.max_new_tokens - 1):
             if self.tokenizer and token_id == self.tokenizer.eos_token_id:
                 break
 
             decode_ids = next_token.view(1, 1)  # [B=1, 1]
-            logits, gdn_states, kv_caches = self.model.forward_decode(decode_ids, gdn_states, kv_caches=kv_caches)
+            # Position of the new token = prompt_len + step (the token we just sampled)
+            positions = torch.tensor([prompt_len + step], device=self.device, dtype=torch.int64)
+            logits, gdn_states, kv_caches, conv_states = self.model.forward_decode(
+                decode_ids, gdn_states, kv_caches=kv_caches,
+                conv_states=conv_states, positions=positions,
+            )
             next_token = self.model.greedy_sample(logits)
             token_id = next_token.item()
 
