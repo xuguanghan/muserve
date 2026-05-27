@@ -42,6 +42,13 @@ _V_DIM_LOCAL = _V_DIM // TP_SIZE   # 1024
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # Qwen3.5 uses Gemma-style RMS norm: weight stores offset from 1.0
+    w = (1.0 + weight.float()).to(x.dtype)
+    return torch.nn.functional.rms_norm(x, (x.shape[-1],), w, eps)
+
+
+def rms_norm_direct(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # Standard RMS norm using weight directly (for RMSNormGated in GDN)
     w = weight if weight.dtype == x.dtype else weight.to(x.dtype)
     return torch.nn.functional.rms_norm(x, (x.shape[-1],), w, eps)
 
@@ -85,18 +92,23 @@ def _split_qkv(qkv: torch.Tensor) -> tuple:
     return q, k, v
 
 
-def _gdn_allgather_out_proj(out_local: torch.Tensor, weights: dict) -> torch.Tensor:
+def _gdn_allgather_out_proj(out_local: torch.Tensor, weights: dict, _diag=None) -> torch.Tensor:
     """AllGather GDN 局部输出 → 完整 v_dim，再做 out_proj。"""
     # out_local: [..., V_DIM_LOCAL=1024]
     orig_shape = out_local.shape
     flat = out_local.reshape(-1, _V_DIM_LOCAL)          # [M, 1024]
+    if _diag: _diag("og.flat", flat)
     parts = [torch.zeros_like(flat) for _ in range(TP_SIZE)]
     dist.all_gather(parts, flat)
     gathered = torch.cat(parts, dim=-1)                  # [M, 8192]
+    if _diag: _diag("og.gathered", gathered)
     gathered = gathered.reshape(orig_shape[:-1] + (_V_DIM,))
 
     w_out = weights["gdn.out_proj.weight"]
     s_out = weights.get("gdn.out_proj.weight_scale_inv")
+    if _diag:
+        _diag("og.w_out", w_out.float())
+        if s_out is not None: _diag("og.s_out", s_out.float())
     if s_out is not None:
         return fp8_linear(gathered, w_out, s_out)
     return bf16_linear(gathered, w_out)
@@ -168,7 +180,19 @@ def gdn_decode_forward(
         state, output,
     )
 
+    # Apply output norm (per-head RMS norm on V_dim) — Gemma-style (1+w)
+    norm_w = weights["gdn.norm.weight"]
+    output = rms_norm(output, norm_w)
+
+    # Z-gate: silu(z) * normed_output
+    w_z = weights["gdn.in_proj_z.weight"]
+    s_z = weights.get("gdn.in_proj_z.weight_scale_inv")
+    z = fp8_linear(hidden, w_z, s_z) if s_z is not None else bf16_linear(hidden, w_z)
+    z = F.silu(z)  # [B, 1, V_DIM_LOCAL]
+
     out_local = output.reshape(B, 1, _V_DIM_LOCAL)
+    out_local = z * out_local
+
     out_proj = _gdn_allgather_out_proj(out_local, weights)
     return out_proj, state
 
@@ -178,16 +202,46 @@ def gdn_prefill_forward(
     cu_seqlens: torch.Tensor,
     weights: dict,
     initial_state=None,
+    layer_idx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _gd(tag, t):
+        if layer_idx is None:
+            return
+        ft = t.float()
+        nan_n = torch.isnan(ft).sum().item()
+        inf_n = torch.isinf(ft).sum().item()
+        is_rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+        # 在 L01 强制所有 rank 打印（定位 mate kernel 哪个 rank 输入异常）
+        force_all = (layer_idx == 1)
+        if (nan_n or inf_n) or force_all:
+            r = dist.get_rank() if dist.is_initialized() else 0
+            flag = f" nan={nan_n} inf={inf_n}" if (nan_n or inf_n) else ""
+            print(f"  [GDN L{layer_idx:02d} r{r} {tag}] norm={ft.norm().item():.3e} max={ft.abs().max().item():.3e}{flag} shape={tuple(t.shape)}", flush=True)
+        elif is_rank0:
+            print(f"  [GDN L{layer_idx:02d} {tag}] norm={ft.norm().item():.3e} max={ft.abs().max().item():.3e} shape={tuple(t.shape)}", flush=True)
+
     total, _ = hidden.shape
+    _gd("hidden_in", hidden)
     w_qkv = weights["gdn.in_proj_qkv.weight"]
     s_qkv = weights.get("gdn.in_proj_qkv.weight_scale_inv")
     qkv = fp8_linear(hidden, w_qkv, s_qkv) if s_qkv is not None else bf16_linear(hidden, w_qkv)
+    _gd("qkv_post_fp8", qkv)
+
+    # Causal conv1d + SiLU (depthwise, kernel_size=4, groups=C)
+    conv_w = weights["gdn.conv1d.weight"]  # [C, 1, 4]
+    C = qkv.shape[-1]
+    qkv_conv = qkv.unsqueeze(0).transpose(1, 2)  # [1, C, total]
+    qkv_conv = F.pad(qkv_conv, (3, 0))  # causal left-pad
+    qkv_conv = F.conv1d(qkv_conv, conv_w, groups=C)  # [1, C, total]
+    qkv_conv = F.silu(qkv_conv)
+    qkv = qkv_conv.transpose(1, 2).squeeze(0)  # [total, C]
+    _gd("qkv_post_conv", qkv)
 
     q, k, v = _split_qkv(qkv)
     q = q.reshape(total, -1, GDN_KEY_DIM).contiguous()
     k = k.reshape(total, -1, GDN_KEY_DIM).contiguous()
     v = v.reshape(total, -1, GDN_VALUE_DIM).contiguous()
+    _gd("q", q); _gd("k", k); _gd("v", v)
 
     # Compute alpha (g) and beta from hidden states (same as decode kernel)
     # decode: x = a + dt_bias; softplus_x = softplus(x); g = -exp(A_log) * softplus_x
@@ -196,6 +250,7 @@ def gdn_prefill_forward(
     w_b = weights["gdn.in_proj_b.weight"]
     a_raw = bf16_linear(hidden, w_a).float()  # [total, num_v_heads_local]
     b_raw = bf16_linear(hidden, w_b).float()
+    _gd("a_raw", a_raw); _gd("b_raw", b_raw)
     num_v_heads_local = v.shape[1]
     rank = w_a.device.index or 0
     A_log = weights["gdn.A_log"][rank * num_v_heads_local:(rank + 1) * num_v_heads_local].float()
@@ -203,16 +258,38 @@ def gdn_prefill_forward(
     x = a_raw + dt_bias  # [total, H]
     softplus_x = F.softplus(x)
     g_log = -torch.exp(A_log) * softplus_x  # [total, H]
-    g = torch.exp(g_log).contiguous()  # alpha in (0,1]
+    # Clamp to FLT_MIN to avoid underflow → 0 → log(0)=-inf in mate kernel
+    # chunk_local_cumsum 仅处理 (0, FLT_MIN) 的 subnormal，alpha==0 会产生 -inf 传染 NaN
+    g = torch.exp(g_log).clamp(min=1.1754943508222875e-38).contiguous()  # alpha in (0,1]
     beta = torch.sigmoid(b_raw).contiguous()
+    _gd("g", g); _gd("beta", beta)
 
     out, final_state = gdn_pre.chunk_gated_delta_rule(
         q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens,
         initial_state=initial_state, output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
-    # out: [total, local_V_heads, V_dim] → [total, V_DIM_LOCAL]
+    # out: [total, local_V_heads, V_dim]
+    _gd("chunk_out", out); _gd("final_state", final_state)
+
+    # Apply output norm (per-head RMS norm on V_dim) — uses weight directly (not Gemma-style)
+    norm_w = weights["gdn.norm.weight"]
+    out = rms_norm_direct(out, norm_w)
+    _gd("post_norm", out)
+
+    # Z-gate: silu(z) * normed_output
+    w_z = weights["gdn.in_proj_z.weight"]
+    s_z = weights.get("gdn.in_proj_z.weight_scale_inv")
+    z = fp8_linear(hidden, w_z, s_z) if s_z is not None else bf16_linear(hidden, w_z)
+    z = F.silu(z)  # [total, V_DIM_LOCAL]
+    _gd("z_silu", z)
+
     out_local = out.reshape(total, _V_DIM_LOCAL)
-    out_proj = _gdn_allgather_out_proj(out_local, weights)  # [total, HIDDEN]
+    out_local = z * out_local
+    _gd("z_gated", out_local)
+
+    out_proj = _gdn_allgather_out_proj(out_local, weights, _diag=_gd)  # [total, HIDDEN]
+    _gd("out_proj", out_proj)
     return out_proj, final_state
 
 
@@ -246,16 +323,20 @@ def _attn_forward(
 
     total = x.shape[0]
 
-    # Q projection (col-sharded, includes gate): [total, 2048] = 4 Q heads + 4 gate heads
+    # Q projection (col-sharded, includes gate): [total, 2048] = 4 heads × 2 (q+gate) × 256
+    # checkpoint 中 q+gate 在每个 head 内交错存放（sglang QKVParallelLinear 的布局，
+    # 已通过 diag_weight_layout.py 验证：q 子块 RMS ≈ 0.0001, gate 子块 RMS ≈ 0.0002，
+    # 在每个 head 内部交错出现）：
+    #   [head0_q | head0_gate | head1_q | head1_gate | ...]
+    # 必须先 reshape 成 [..., local_heads, 2*head_dim] 再 chunk(2, dim=-1) 出 q/gate。
     w_q = weights["attn.q_proj.weight"]
     s_q = weights.get("attn.q_proj.weight_scale_inv")
     qg = fp8_linear(x, w_q, s_q) if s_q is not None else bf16_linear(x, w_q)
 
-    # Split Q and gate (each has local_heads × head_dim per rank)
-    local_qg_dim = qg.shape[-1]
-    local_q_dim = local_qg_dim // 2
-    q_local = qg[..., :local_q_dim]           # [total, 4*256=1024]
-    gate_local = qg[..., local_q_dim:]        # [total, 1024]
+    qg_per_head = qg.reshape(total, _ATTN_Q_HEADS_LOCAL, 2 * _ATTN_HEAD_DIM)
+    q_per_head, gate_per_head = torch.chunk(qg_per_head, 2, dim=-1)
+    q_local = q_per_head.reshape(total, _ATTN_Q_HEADS_LOCAL * _ATTN_HEAD_DIM)
+    gate_local = gate_per_head.reshape(total, _ATTN_Q_HEADS_LOCAL * _ATTN_HEAD_DIM)
 
     # K, V projections (not sharded): [total, 512] = 2 heads × 256
     w_k = weights["attn.k_proj.weight"]
@@ -397,7 +478,9 @@ def moe_forward(
     logits = bf16_linear(hidden, gate_w).float()
     scores = torch.softmax(logits, dim=-1)
     topk_w, topk_ids = torch.topk(scores, NUM_EXPERTS_PER_TOK, dim=-1)
-    topk_w = (topk_w / topk_w.sum(dim=-1, keepdim=True)).to(torch.bfloat16)
+    # HF Qwen3_5MoeTopKRouter: top-k 概率重归一化为和=1（HF modeling_qwen3_5_moe.py:778）
+    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+    topk_w = topk_w.to(torch.bfloat16)
 
     # ── 2. 展开为固定大小 [total*topk, ...] ──
     # 每个 token 有 topk 个 slot，全部展开（不筛选本卡 expert）
@@ -604,29 +687,52 @@ def layer_forward_prefill(
     cu_seqlens: torch.Tensor,   # [num_seqs+1] int64
     weights: dict,
     initial_gdn_state: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
     """单层 prefill forward。返回 (hidden, gdn_state, kv_cache)。"""
     is_attn_layer = "attn.q_proj.weight" in weights
 
+    def _diag(tag: str, t: torch.Tensor):
+        if layer_idx is None:
+            return
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        ft = t.float()
+        nan_n = torch.isnan(ft).sum().item()
+        inf_n = torch.isinf(ft).sum().item()
+        if nan_n or inf_n:
+            print(f"[DIAG L{layer_idx:02d} {tag}] norm={ft.norm().item():.3e} nan={nan_n} inf={inf_n} shape={tuple(t.shape)}", flush=True)
+        else:
+            print(f"[DIAG L{layer_idx:02d} {tag}] norm={ft.norm().item():.3e} max={ft.abs().max().item():.3e} shape={tuple(t.shape)}", flush=True)
+
+    _diag(f"in   ({'ATTN' if is_attn_layer else 'GDN '})", hidden)
+
     # 1. Pre-norm + attention/GDN
     norm_w = weights["input_layernorm.weight"]
     x = rms_norm(hidden, norm_w)
+    _diag("post-norm1   ", x)
 
     new_kv = None
     if is_attn_layer:
         # Pass as 3D [1, total, HIDDEN] so _attn_forward uses FMHA (T > 1)
         x_3d = x.unsqueeze(0)
         attn_out, new_kv = _attn_forward(x_3d, weights)
+        _diag("attn_out     ", attn_out)
         hidden = hidden + attn_out.squeeze(0)
         final_state = initial_gdn_state
     else:
-        gdn_out, final_state = gdn_prefill_forward(x, cu_seqlens, weights, initial_gdn_state)
+        gdn_out, final_state = gdn_prefill_forward(x, cu_seqlens, weights, initial_gdn_state, layer_idx=layer_idx)
+        _diag("gdn_out      ", gdn_out)
         hidden = hidden + gdn_out
+    _diag("post-residual1", hidden)
 
     # 2. Post-norm + MoE
     norm_w2 = weights["post_attention_layernorm.weight"]
     x = rms_norm(hidden, norm_w2)
+    _diag("post-norm2   ", x)
     moe_out = moe_forward(x, weights)
+    _diag("moe_out      ", moe_out)
     hidden = hidden + moe_out
+    _diag("out          ", hidden)
 
     return hidden, final_state, new_kv

@@ -61,6 +61,26 @@ def _row_shard(tensor: torch.Tensor, rank: int) -> torch.Tensor:
     return tensor[..., rank * k:(rank + 1) * k].contiguous()
 
 
+def _merged_col_shard(tensor: torch.Tensor, rank: int, segments: list[int]) -> torch.Tensor:
+    """Merged column 切分：dim=0 上的多段（如 [q|k|v]）各自独立 TP 切再拼接。
+
+    对应 sglang MergedColumnParallelLinear 的语义：output_sizes 中的每段独立切。
+    简单 _col_shard 会把 dim=0 当作单一连续段，导致 q/k/v 错位。
+    """
+    assert sum(segments) == tensor.shape[0], (
+        f"segments sum {sum(segments)} != tensor.shape[0] {tensor.shape[0]}"
+    )
+    shards = []
+    offset = 0
+    for seg in segments:
+        sub = tensor[offset:offset + seg]
+        assert seg % TP_SIZE == 0, f"segment {seg} not divisible by TP_SIZE {TP_SIZE}"
+        per_rank = seg // TP_SIZE
+        shards.append(sub[rank * per_rank:(rank + 1) * per_rank])
+        offset += seg
+    return torch.cat(shards, dim=0).contiguous()
+
+
 def load_layer_weights(
     model_path: str,
     layer_idx: int,
@@ -105,15 +125,30 @@ def load_layer_weights(
         return t
 
     # ── GDN（GatedDeltaNet 线性注意力）────────────────────────────────────────
-    # in_proj_qkv: [12288, 4096] fp8  → 列切分 → [1536, 4096]（q/k/v 各 512 维/卡）
+    # in_proj_qkv: [12288, 4096] fp8  → 分段列切分 → [1536, 4096]
+    #   checkpoint 布局: [q_full(2048) | k_full(2048) | v_full(8192)] dim=0
+    #   每段独立按 TP 切再拼接：rank r 拿到 [q(256) | k(256) | v(1024)]
     # in_proj_a:   [64, 4096]    bf16 → 列切分 → [8, 4096]（gate a，本卡 8 heads）
     # in_proj_b:   [64, 4096]    bf16 → 列切分 → [8, 4096]（gate b）
     # in_proj_z:   [8192, 4096]  fp8  → 列切分 → [1024, 4096]
     # out_proj:    [4096, 8192]  fp8  → 不切分，每卡持有完整权重
     #   GDN 输出先 AllGather 到 [B, 8192]，再做完整 out_proj → [B, 4096]
     #   不需要 AllReduce（out_proj 不切分）
+    _Q_DIM = GDN_NUM_K_HEADS * GDN_KEY_DIM    # 2048
+    _K_DIM = GDN_NUM_K_HEADS * GDN_KEY_DIM    # 2048
+    _V_DIM = GDN_NUM_V_HEADS * GDN_VALUE_DIM  # 8192
+    _QKV_SEGMENTS = [_Q_DIM, _K_DIM, _V_DIM]
+    t = maybe("linear_attn.in_proj_qkv.weight")
+    if t is not None:
+        weights["gdn.in_proj_qkv.weight"] = _merged_col_shard(t, rank, _QKV_SEGMENTS).to(device)
+    s = maybe("linear_attn.in_proj_qkv.weight_scale_inv")
+    if s is not None:
+        # fp8 weight_scale_inv 是 [N//128, K//128] 的 block-wise scale
+        # 每段在 dim=0 上的块数 = seg // 128
+        scale_segments = [seg // 128 for seg in _QKV_SEGMENTS]
+        weights["gdn.in_proj_qkv.weight_scale_inv"] = _merged_col_shard(s, rank, scale_segments).to(device)
+
     for proj, shard_fn in [
-        ("in_proj_qkv", _col_shard),
         ("in_proj_a",   _col_shard),
         ("in_proj_b",   _col_shard),
         ("in_proj_z",   _col_shard),
@@ -133,14 +168,20 @@ def load_layer_weights(
     if s is not None:
         weights["gdn.out_proj.weight_scale_inv"] = s.to(device)
 
-    # GDN 非权重参数（不切分）
+    # GDN 标量参数（A_log/dt_bias/norm.weight 与 qkv 通道无关，保留全量）
     # A_log, dt_bias 必须是 float32（gated_delta_rule_decode 要求）
-    for param in ("A_log", "dt_bias", "conv1d.weight", "norm.weight"):
+    for param in ("A_log", "dt_bias", "norm.weight"):
         t = maybe(f"linear_attn.{param}")
         if t is not None:
             if param in ("A_log", "dt_bias"):
                 t = t.float()
             weights[f"gdn.{param}"] = t.to(device)
+
+    # conv1d.weight: depthwise conv，通道数 = qkv 总维度，必须跟 in_proj_qkv 同样分段切
+    # 全量 [12288, 1, 4] → 每卡 [1536, 1, 4]（q256 + k256 + v1024 通道顺序）
+    t = maybe("linear_attn.conv1d.weight")
+    if t is not None:
+        weights["gdn.conv1d.weight"] = _merged_col_shard(t, rank, _QKV_SEGMENTS).to(device)
 
     # ── Self-Attention（标准 GQA，每 4 层一个）────────────────────────────────────
     # q_proj: [16384, 4096] fp8 → col shard → [2048, 4096]（含 gate）

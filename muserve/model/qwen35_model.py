@@ -130,6 +130,7 @@ class Qwen35Model:
             for i in range(len(self.layer_weights)):
                 hidden, final_state, new_kv = layer_forward_prefill(
                     hidden, cu_seqlens, self.layer_weights[i],
+                    layer_idx=i,
                 )
                 gdn_states.append(final_state)
                 kv_caches.append(new_kv)
@@ -184,7 +185,6 @@ class Qwen35Model:
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """Greedy sampling from TP-sharded logits。返回 token ids [B]。"""
-        # 每卡有 VOCAB/TP 的 logits，找本地 argmax 再 AllReduce
         local_max_val, local_max_idx = logits.max(dim=-1)  # [B]
         vocab_per_rank = VOCAB_SIZE // TP_SIZE
         global_idx = local_max_idx + self.rank * vocab_per_rank
@@ -196,13 +196,13 @@ class Qwen35Model:
         )
         all_idxs = torch.zeros(
             logits.shape[0], TP_SIZE,
-            device=logits.device, dtype=torch.int64,
+            device=logits.device, dtype=torch.float32,
         )
         all_vals[:, self.rank] = local_max_val
-        all_idxs[:, self.rank] = global_idx
+        all_idxs[:, self.rank] = global_idx.float()
         from muserve.distributed import all_reduce
         all_reduce(all_vals)
-        all_reduce(all_idxs.float())
+        all_reduce(all_idxs)
 
         # 选全局最大值对应的 token
         best_rank = all_vals.argmax(dim=-1)  # [B]

@@ -534,42 +534,95 @@ muserve 当前使用的 mate 算子：gdn_decode, gdn_prefill, gemm_fp8_nt_group
 
 ## TODO（2026-05-27）
 
-### P0：阻塞推理正确性
-- [ ] **修复 attention 层 decode 无 KV cache（根因，最高优先级）**
-  - 现象（`test_short2.log`，B=8, prompt='2+2='）：
-    - Prefill logits 正常：min=-5.59 max=4.59，无 NaN
-    - Decode 20 步全部生成 token 220（空格），形成 degenerate 不动点
-    - 之后 MCCL ALLGATHER/ALLREDUCE 全面崩溃（连锁反应，非根因）
-  - 根因定位（`qwen35_layer.py:_attn_forward` decode 分支，T=1）：
-    ```python
-    k_expanded = k_heads.repeat_interleave(...)  # 只来自当前 token 的 K
-    v_expanded = v_heads.repeat_interleave(...)  # 只来自当前 token 的 V
-    attn_out = v_expanded                         # softmax(scalar)=1，输出=当前 v
-    ```
-    16 层 standard attention（layers [0,3,7,11,15,19,23,27,31,35,39,43,47,51,55,59]）
-    每步都把上下文清零，只看见自己。GDN 44 层有 state 传递，attention 16 层完全缺失 KV cache。
-  - 修复方案（**先在不开 graph 的简单路径**验证正确性）：
-    1. `qwen35_model.py:forward_prefill` 末尾：每个 attention 层把完整 K、V 存入 `kv_caches: list[(K, V)]`（仅 16 层 attention 有，GDN 层占位 None），与 `gdn_states` 并列返回
-    2. `qwen35_model.py:forward_decode` 新增 `kv_caches` 参数：每个 attention 层 append 当前 K、V 到 cache，再做完整 GQA attention（用 cache 里的全部 K、V）
-    3. `qwen35_layer.py:_attn_forward` decode 分支接受 `(past_k, past_v)`，concat 当前 K、V 后做 GQA softmax attention（用 `F.softmax`，非 fmha）
-    4. `test_short_prompt.py`：移除 graph capture，直接调用 eager `forward_decode`，验证生成"4"或合理结果
-  - 接受标准：
-    - [ ] B=8 short prompt '2+2=' eager decode 输出包含 '4' 或合理回答
-    - [ ] decode logits 不再退化为单一 token 的不动点
-    - [ ] 不引入 MCCL 错误
-  - 后续（不在本任务范围）：graph capture 适配 — KV cache 用预分配 buffer + position 索引保持 Graph 静态性（P1）
-- [ ] **修复 eager B=1 decode 的 MoE GEMM crash**
-  - 现象：B=1 单请求 decode 在 `ragged_moe_gemm_8bit` 报 MUSA_ERROR_ILLEGAL_ADDRESS
-  - 已知 B=8 graph capture 正常（166 tok/s）
-  - 怀疑：B=1 时 expanded tokens 不满足 MoE GEMM 对齐要求
-- [ ] **InferenceLoop shutdown 修复**
-  - 现象：rank 0 设置 `_running=False` 后其他 rank 仍阻塞在 `broadcast_pyobj`
-  - 修复：rank 0 广播 "shutdown" 信号给所有 rank
+### P0：阻塞推理正确性（按优先级排序）
+
+#### P0.1：Prefill 数值爆炸 — 根因调试中 ⚠️
+
+**现象**（`/tmp/prefill_layers3.log`, prompt='2+2=' B=1）：
+- 参考 Qwen3.5-2B (HF transformers): `2+2=` → token 19 `'4'`
+- muserve 397B 实际输出: token 220 `' '` (logit=4.66, 而 token 19 logit 仅 1.80)
+- Hidden norm 逐层爆炸:
+  ```
+  embed:       0.93  ← 正常
+  Layer 1 GDN: 5.41
+  Layer 2 GDN: 14.31
+  Layer 3 GDN: 16.62
+  Layer 4 ATTN: 932    ← 56x 跳变
+  Layer 6 GDN: 8320
+  Layer 30 GDN: 2974272  ← 接近 bf16 溢出
+  ```
+- Logits 分布平坦（max 4.66, 正确 token 仅 1.80），语义信息丢失
+
+**已修复的问题**：
+- ✅ `greedy_sample` bug: `all_reduce(all_idxs.float())` 创建临时 float tensor 丢失结果（commit a809ad9 之后单独提交）
+- ✅ GDN z-gate 缺失: 添加 `silu(in_proj_z * hidden) * rms_norm(gdn_output, gdn.norm.weight)`（已写代码，待提交）
+
+**未解决的问题**（按 sglang qwen3_5.py 对比待修复）：
+- [ ] **Attention 层 O projection 后输出过大** — Layer 4 ATTN: 16.62 → 932 (56x)
+  - 怀疑：`o_proj` FP8 weight_scale 应用不对，或 GQA expand 顺序错
+  - 对比项：sglang `attn_output * sigmoid(gate)` → `self.o_proj(attn_output)` (RowParallelLinear)
+- [ ] **GDN qkvz 切分顺序与 sglang 不一致**
+  - sglang: `in_proj_qkvz` 4 shards = [q, k, v, z]，z 单独 reshape 成 `[seq, nv_tp, head_v_dim]`
+  - muserve: q/k/v 来自 `in_proj_qkv`，z 来自 `in_proj_z`（应该 OK，但要确认切分维度）
+- [ ] **GDN g 计算可能不一致**
+  - sglang 公式（已验证）: `g = -exp(A_log) * softplus(a + dt_bias)`，传 `g_log`（log-space）给 `chunk_gated_delta_rule`
+  - mate `gdn_prefill_forward` 现在传 `g = exp(g_log)`（linear-space alpha）— 需确认 mate kernel API
+- [ ] **MoE 路径** — 暂未发现问题，但需在 GDN/Attention 修复后再验证
+
+**修复策略：精确抄 sglang 关键逻辑**（不全套迁移）
+参考: `/Users/hanxuguang/work/GITRoot/sglang-ori/sglang/python/sglang/srt/models/qwen3_5.py`
+
+| 组件 | 操作 | 文件 |
+|------|------|------|
+| GDN qkvz/ba split | 完全照抄 `fix_query_key_value_ordering` (line 411) | qwen35_layer.py |
+| GDN g/beta 计算 | 照抄 `fused_gdn_gating` 公式 (`g = -exp(A_log) * softplus(a + dt_bias)`) | qwen35_layer.py |
+| RMSNormGated | 用 `norm(x) * silu(z)` 公式（norm_before_gate=True） | qwen35_layer.py |
+| Attention output gate | 确认顺序：`attn_output * sigmoid(gate)` → `o_proj` | qwen35_layer.py |
+| MoE | 保持 mate batched (已优化) | qwen35_layer.py |
+| Graph capture | 保持 muserve (已达 166 tok/s) | graph_decode.py |
+
+**验证标准**：
+- [ ] Layer-by-layer h_norm 不超过 ~100（参考 Qwen3.5-2B 也应在此范围）
+- [ ] B=1 short prompt '2+2=' → 输出包含 '4'
+- [ ] B=1 'The capital of France is' → 输出包含 'Paris'
+- [ ] B=8 同 prompt 输出与 B=1 一致（验证 cross-seq 无干扰）
+
+#### P0.2：Attention KV cache（已完成代码，待 prefill 修复后联合验证）
+- ✅ 代码已实现（commit a809ad9）
+- ⚠️ 因 prefill 错误未能端到端验证
+
+#### P0.3：MoE eager B=1 crash
+- [ ] 现象：B=1 单请求 decode 在 `ragged_moe_gemm_8bit` 报 MUSA_ERROR_ILLEGAL_ADDRESS
+- [ ] 怀疑：B=1 时 expanded tokens 不满足 MoE GEMM 对齐要求
+
+#### P0.4：InferenceLoop shutdown
+- [ ] rank 0 广播 "shutdown" 信号给所有 rank
+
+---
+
+### P0.5：参考 sglang qwen3_5_mtp 实现 MTP（多 token 预测）
+
+**目标**：将 sglang 的 `qwen3_5_mtp.py` 移植到 muserve，实现 speculative decoding，decode 吞吐 1.5-2x。
+
+**参考实现**：
+- `/Users/hanxuguang/work/GITRoot/sglang-ori/sglang/python/sglang/srt/models/qwen3_5_mtp.py`
+- `/Users/hanxuguang/work/GITRoot/sglang-ori/sglang/python/sglang/srt/speculative/` （speculative decoding 框架）
+
+**关键点（待详细调研）**：
+- [ ] MTP head 的权重结构（额外的 prediction layer）
+- [ ] Draft → verify → accept/reject 流程
+- [ ] 与 muserve 现有 graph capture 的集成（MTP 步骤需要变长输出）
+- [ ] Accept rate 监控（参考 sglang 的 `accept_length`、`accept_rate` 指标）
+
+**前提**：P0.1 prefill 正确性修复完成后再启动。
+
+---
 
 ### P1：性能进一步优化（166 → 200+ tok/s）
 - [ ] mate kernel unsafe flags 上游修复（PR 到 mate 仓库）
 - [ ] moe_fused_gate 替换分离 gate（预计 +5-10%）
 - [ ] MUSA Graph multi-pool 减少 fragmentation
+- [ ] Attention KV cache 适配 Graph capture（预分配 buffer + position 索引）
 
 ### P2：场景验证
 - [ ] 32K TTFT 测试（FMHA 已替换 sdpa，验证 < 1.5s）
@@ -577,7 +630,7 @@ muserve 当前使用的 mate 算子：gdn_decode, gdn_prefill, gemm_fp8_nt_group
 - [ ] 与 SGLang 参考实现 logits diff < 1e-2
 
 ### P3：长远优化
-- [ ] gdn_mtp speculative decoding（1.5-2x）
+- [ ] gdn_mtp speculative decoding（在 P0.5 基础上接入 mate 的 MTP kernel）
 - [ ] fp8_mqa_logits + attention KV cache（attention decode 2x）
 - [ ] persistent kernel（300-420 tok/s）
 
