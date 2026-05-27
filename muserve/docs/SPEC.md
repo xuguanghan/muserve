@@ -1,6 +1,6 @@
 # Spec: Qwen3.5-397B-FP8 极简推理框架（S5000 专用）
 
-**版本**: 0.2  **日期**: 2026-05-25  **目标**: 单流 decode 150~200 tok/s（部分融合）→ 300~420 tok/s（persistent kernel）
+**版本**: 0.3  **日期**: 2026-05-27  **目标**: 单流 decode 150~200 tok/s（部分融合）→ 300~420 tok/s（persistent kernel）
 
 ---
 

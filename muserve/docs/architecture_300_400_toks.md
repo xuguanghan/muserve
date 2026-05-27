@@ -2,7 +2,7 @@
 
 **适用场景**：Qwen3.5-397B-A17B-FP8，8×S5000（80GB HBM/卡），MUSA SDK 5.1.0
 **硬件上限**：~420 tok/s（由 S5000 HBM 带宽决定，17B active params × 1 byte / 7.2 TB/s）
-**当前进展**：134 tok/s（MUSA Graph capture，2026-05-26）
+**当前进展**：166.23 tok/s（MUSA Graph capture，mate 0.2.1，2026-05-27）
 
 ---
 

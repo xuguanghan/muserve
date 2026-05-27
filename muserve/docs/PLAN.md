@@ -16,15 +16,15 @@
 
 ---
 
-## 当前状态（2026-05-26）
+## 当前状态（2026-05-27）
 
 | 指标 | 目标 | 当前 | 差距 |
 |------|------|------|------|
-| Batch decode (B=8, 60层) | ≥ 150 tok/s | **154.49 tok/s** ✓ | 达成 |
-| Per-layer decode (Graph) | ~0.04ms (硬件上限) | 0.86ms | 21x |
+| Batch decode (B=8, 60层) | ≥ 150 tok/s | **166.23 tok/s** ✓ | 达成（+7.6% vs 旧版） |
+| Per-layer decode (Graph) | ~0.04ms (硬件上限) | 0.80ms | 20x |
 | TTFT (32K) | < 1.5s | 未测 | — |
-| API | Anthropic Messages | 未实现 | — |
-| 正确性 | vs SGLang < 1e-2 | 未验证 | — |
+| API | Anthropic Messages | 部分实现 | InferenceLoop shutdown hang |
+| 正确性 | vs SGLang < 1e-2 | 未验证 | eager B=1 MoE crash |
 
 ---
 
@@ -466,6 +466,24 @@ while True:
 ### Task 3.4：CPU KV Cache Offload（可选）
 - [ ] 超长上下文（128K+）时 LRU 换出到 pinned CPU memory
 
+### Task 3.5：32K 压测验证
+
+**推荐脚本**：`bench_multiround_prefix_cached.py`
+
+| 脚本 | 场景 | Prefix Cache | Token 精确 | 适合 32K |
+|------|------|-------------|-----------|---------|
+| `bench_loadpup_prefix_cached.py` | 25K+3K=28K, evalscope 格式 | ✅ 89% | ✅ | ⚠️ |
+| `bench_multiround_openai.py` | 可配 32K，无 prefix 共享 | ❌ | ❌ 字符级 | ❌ |
+| `bench_multiround_anthropic.py` | 可配 32K，Anthropic API | ❌ | ❌ 字符级 | ❌ |
+| **`bench_multiround_prefix_cached.py`** | **25K+3K=28K, 可配** | **✅** | **✅** | **✅** |
+| `bench_multiround_tokenizer.py` | 28K 全量，无 prefix | ❌ | ✅ | ❌ |
+
+**32K 压测参数**：
+```bash
+BENCH_CTX=32000 BENCH_SHARED_RATIO=0.875 BENCH_N=8 python bench_multiround_prefix_cached.py
+# 32000 × 0.875 = 28000 prefix (document) + 4000 suffix (question)
+```
+
 ---
 
 ## Phase 4：300-420 tok/s（算子深度融合）
@@ -476,6 +494,41 @@ while True:
 配合 MUSA Graph replay 消除 dispatch overhead，逼近硬件上限。
 
 预估工程量：2-3 周。
+
+---
+
+## mate 算子优化路线图（2026-05-26）
+
+muserve 当前使用的 mate 算子：gdn_decode, gdn_prefill, gemm_fp8_nt_groupwise, ragged_m_moe_gemm_8bit, _fmha_fwd
+
+### P0：mate FMHA 替换 sdpa（✅ 已完成）
+
+- **问题**：MUSA 后端不支持 head_dim=256 的 FlashAttention，fallback 到 math attention（O(n²) 显存）
+- **修复**：用 `mate.jit.attention.fmha._fmha_fwd` 替换 `torch.nn.functional.scaled_dot_product_attention`
+- **预期提升**：32K TTFT 3-10x（attention 层从 O(n²) → O(n)）
+- **状态**：代码已替换，待验证
+
+### P1：moe_fused_gate 替换分离 gate 计算
+
+- **问题**：当前 MoE gate 分 3 步（bf16_linear → softmax → topk），3 次 kernel launch + 中间 tensor 分配
+- **修复**：用 `mate.moe_fused_gate` 单 kernel 完成 sigmoid/softmax + grouped topk + renormalize
+- **预期提升**：MoE gate 部分 2-3x，整体 decode 约 5-10%
+- **工作量**：小（API 直接替换，参数映射：num_expert_group=8, topk_group=4, topk=8）
+
+### P2：gdn_mtp 多 token 预测
+
+- **问题**：当前 decode 每步只生成 1 个 token
+- **修复**：用 `mate.gdn_kernels.tilelang.gdn_mtp` 实现 speculative decoding，一次预测 2-4 token
+- **预期提升**：decode 吞吐 1.5-2x（取决于 acceptance rate）
+- **工作量**：大（需要实现 speculative decoding 框架：draft → verify → accept/reject）
+
+### P3：fp8_mqa_logits 加速 attention decode
+
+- **问题**：attention 层 decode 用 sdpa（T=1 退化为 matmul），无 KV cache
+- **修复**：实现 attention KV cache + 用 `mate.deep_gemm.fp8_mqa_logits` 做 FP8 融合 logits
+- **预期提升**：attention 层 decode 2x
+- **工作量**：中（需要先实现 KV cache 管理）
+- **前提**：P0 完成后评估 attention 层在 decode 中的占比
 
 ---
 

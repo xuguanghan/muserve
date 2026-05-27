@@ -102,19 +102,24 @@ def _gdn_allgather_out_proj(out_local: torch.Tensor, weights: dict) -> torch.Ten
     return bf16_linear(gathered, w_out)
 
 
-_GDN_DECODE_KERNEL_FN = None  # 缓存编译好的 tilelang kernel，避免每次 121ms 的 cache lookup
+_GDN_DECODE_KERNEL_FN = None  # 缓存编译好的 tilelang kernel，避免每次 cache lookup
+_GDN_DECODE_SCALE = None
 
 
 def _init_gdn_decode_kernel(B, Hq, HV, K, V):
-    """首次调用：编译 kernel 并缓存 JITKernel 对象。"""
-    global _GDN_DECODE_KERNEL_FN
+    """首次调用：编译 kernel 并缓存 JITKernel 对象（mate 0.2.1 API）。"""
+    global _GDN_DECODE_KERNEL_FN, _GDN_DECODE_SCALE
     import mate.gdn_kernels.tilelang.gdn_decode as _tl_mod
-    scale = float(K ** -0.5)
+    _GDN_DECODE_SCALE = float(K ** -0.5)
+    config = _tl_mod._resolve_autotuned_kernel_config(B)
     _GDN_DECODE_KERNEL_FN = _tl_mod._get_decode_fp32_vk_kernel(
-        batch=B, qk_head=Hq, head=HV, dim_k=K, dim_v=V,
+        qk_head=Hq, head=HV, dim_k=K, dim_v=V,
         input_dtype="bfloat16", gate_batch_dtype="bfloat16",
-        scale=scale, use_qk_l2norm=True,
-        num_stages=3, threads=128, v_tile=8,
+        dt_bias_dtype="bfloat16", output_dtype="bfloat16",
+        use_qk_l2norm=True,
+        v_tile=config["v_tile"],
+        num_blocks_per_state=config["num_blocks_per_state"],
+        stage=config["stage"],
     )
 
 
@@ -139,23 +144,27 @@ def gdn_decode_forward(
 
     w_ab = torch.cat([weights["gdn.in_proj_a.weight"], weights["gdn.in_proj_b.weight"]], dim=0)
     ab = bf16_linear(hidden, w_ab)
-    a = ab[..., :ab.shape[-1]//2].clone()
-    b = ab[..., ab.shape[-1]//2:].clone()
+    # reshape+contiguous 强制 stride 规范化
+    # MUSA 上 ab[..., :half] 是 [B,1,8] stride (16,16,1)，reshape 到 [B,8] 只是 view
+    # 得到 stride (16,1)，kernel 要求 stride[0]=8，必须 contiguous() 强制重新分配
+    half = ab.shape[-1] // 2
+    a = ab[..., :half].reshape(B, half).contiguous()
+    b = ab[..., half:].reshape(B, half).contiguous()
     v_heads_local = v.shape[2]
     rank = weights["gdn.A_log"].device.index or 0
     A_log   = weights["gdn.A_log"][rank * v_heads_local:(rank + 1) * v_heads_local]
-    dt_bias = weights["gdn.dt_bias"][rank * v_heads_local:(rank + 1) * v_heads_local]
+    dt_bias = weights["gdn.dt_bias"][rank * v_heads_local:(rank + 1) * v_heads_local].to(torch.bfloat16)
 
     if _GDN_DECODE_KERNEL_FN is None:
         Hq = q.shape[2]
         _init_gdn_decode_kernel(B, Hq, v_heads_local, GDN_KEY_DIM, GDN_VALUE_DIM)
 
-    # 直接调用缓存的 JITKernel（0.06ms），跳过 mate API（121ms）
     output = torch.empty(B, v_heads_local, GDN_VALUE_DIM,
                          device=hidden.device, dtype=hidden.dtype)
     _GDN_DECODE_KERNEL_FN(
         q.squeeze(1), k.squeeze(1), v.squeeze(1),
-        A_log, a.squeeze(1), dt_bias, b.squeeze(1),
+        A_log, a, dt_bias, b,
+        _GDN_DECODE_SCALE,
         state, output,
     )
 
@@ -180,8 +189,11 @@ def gdn_prefill_forward(
     k = k.reshape(total, -1, GDN_KEY_DIM).contiguous()
     v = v.reshape(total, -1, GDN_VALUE_DIM).contiguous()
 
+    num_v_heads_local = v.shape[1]
+    g = torch.ones(total, num_v_heads_local, dtype=torch.float32, device=hidden.device)
+    beta = torch.ones(total, num_v_heads_local, dtype=torch.float32, device=hidden.device)
     out, final_state = gdn_pre.chunk_gated_delta_rule(
-        q, k, v, cu_seqlens=cu_seqlens,
+        q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens,
         initial_state=initial_state, output_final_state=True,
     )
     # out: [total, local_V_heads, V_dim] → [total, V_DIM_LOCAL]
@@ -250,27 +262,23 @@ def _attn_forward(
     if "attn.k_norm.weight" in weights:
         k_heads = rms_norm(k_heads, weights["attn.k_norm.weight"])
 
-    # GQA: expand K/V to match local Q heads
-    # local_q_heads=4, kv_heads=2, local_gqa_ratio=2
-    local_gqa_ratio = _ATTN_Q_HEADS_LOCAL // _ATTN_NUM_KV_HEADS
-    k_expanded = k_heads.repeat_interleave(local_gqa_ratio, dim=1)  # [T, 4, 256]
-    v_expanded = v_heads.repeat_interleave(local_gqa_ratio, dim=1)  # [T, 4, 256]
-
-    # Scaled dot-product attention (causal, simple implementation)
-    # For decode (T=1): no causal mask needed
-    # For prefill: need causal mask, but using simple implementation for now
     scale = _ATTN_HEAD_DIM ** -0.5
-    # [total, heads, dim] → [total, heads, 1] @ [total, heads, dim]^T won't work for multi-token
-    # Use einsum for single-step or simple matmul
-    # For eager baseline, use PyTorch's scaled_dot_product_attention
-    q_t = q_heads.transpose(0, 1).unsqueeze(0)  # [1, heads, total, dim]
-    k_t = k_expanded.transpose(0, 1).unsqueeze(0)
-    v_t = v_expanded.transpose(0, 1).unsqueeze(0)
-
-    attn_out = torch.nn.functional.scaled_dot_product_attention(
-        q_t, k_t, v_t, is_causal=(T > 1)
-    )  # [1, heads, total, dim]
-    attn_out = attn_out.squeeze(0).transpose(0, 1)  # [total, heads, dim]
+    if T > 1:
+        # Prefill: use mate FMHA (supports head_dim=256, handles GQA)
+        from mate.jit.attention.fmha import _fmha_fwd
+        q_4d = q_heads.unsqueeze(0)   # [1, total, 4, 256]
+        k_4d = k_heads.unsqueeze(0)   # [1, total, 2, 256]
+        v_4d = v_heads.unsqueeze(0)   # [1, total, 2, 256]
+        attn_out, _ = _fmha_fwd(q_4d, k_4d, v_4d, softmax_scale=scale, is_causal=True)
+        attn_out = attn_out.squeeze(0)  # [total, 4, 256]
+    else:
+        # Decode (T=1): simple GQA matmul, graph-capture compatible
+        local_gqa_ratio = _ATTN_Q_HEADS_LOCAL // _ATTN_NUM_KV_HEADS
+        k_expanded = k_heads.repeat_interleave(local_gqa_ratio, dim=1)
+        v_expanded = v_heads.repeat_interleave(local_gqa_ratio, dim=1)
+        # q,k,v: [B, heads, dim] → score = sum(q*k) * scale → softmax → * v
+        scores = (q_heads * k_expanded).sum(-1, keepdim=True) * scale
+        attn_out = v_expanded  # T=1: softmax(scalar)=1, output=v
     attn_flat = attn_out.reshape(total, -1)  # [total, local_q_dim=1024]
 
     # Apply output gate (sigmoid)

@@ -35,15 +35,21 @@ class GraphedDecodeStep:
             sample_ids: [B, 1] sample input for capture
             gdn_states: list of GDN state tensors (updated in-place on replay)
         """
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
         B = self.batch_size
         assert sample_ids.shape == (B, 1)
 
         self._input_ids_buf = sample_ids.clone()
 
         # Warmup on default stream (MCCL requires same stream across ranks)
-        for _ in range(3):
+        for i in range(3):
+            if rank == 0:
+                print(f"[graph_capture] warmup {i+1}/3...", flush=True)
             self._run_full_step(self._input_ids_buf, gdn_states)
         torch.musa.synchronize()
+        if rank == 0:
+            print(f"[graph_capture] warmup done, starting capture...", flush=True)
 
         # Capture
         pool = torch.musa.graph_pool_handle()
@@ -53,6 +59,8 @@ class GraphedDecodeStep:
             self._run_full_step(self._input_ids_buf, gdn_states)
         torch.musa.synchronize()
         self._captured = True
+        if rank == 0:
+            print(f"[graph_capture] capture complete.", flush=True)
 
     def step(self):
         """Replay one decode step. input_ids_buf is auto-updated with next tokens."""

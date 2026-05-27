@@ -104,6 +104,9 @@ class InferenceLoop:
             ids_tensor, cu_seqlens, cache_prefix_len=payload.cache_prefix_len,
         )
 
+        # Ensure GDN states are contiguous (decode kernel requires specific strides)
+        gdn_states = [s.contiguous() if s is not None else None for s in gdn_states]
+
         # Sample first token
         next_token = self.model.greedy_sample(logits)
         token_id = next_token.item()
@@ -116,7 +119,7 @@ class InferenceLoop:
             if self.tokenizer and token_id == self.tokenizer.eos_token_id:
                 break
 
-            decode_ids = next_token.unsqueeze(0).unsqueeze(0)
+            decode_ids = next_token.view(1, 1)  # [B=1, 1]
             logits, gdn_states = self.model.forward_decode(decode_ids, gdn_states)
             next_token = self.model.greedy_sample(logits)
             token_id = next_token.item()
