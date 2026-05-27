@@ -72,31 +72,31 @@ class Qwen35Model:
         self,
         input_ids: torch.Tensor,        # [B, 1]
         gdn_states: list[torch.Tensor], # NUM_LAYERS × [B, V_heads, V_dim, K_dim]
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Decode step forward。返回 (logits [B, VOCAB/TP], new_gdn_states)。"""
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor] | None]]:
+        """Decode step forward。返回 (logits, new_gdn_states, new_kv_caches)。"""
         hidden = self.embed(input_ids)  # [B, 1, HIDDEN]
 
         new_states = []
+        new_kv_caches = []
         for i in range(len(self.layer_weights)):
-            hidden, new_state = layer_forward_decode(
-                hidden, gdn_states[i], self.layer_weights[i]
+            past_kv = kv_caches[i] if kv_caches is not None else None
+            hidden, new_state, new_kv = layer_forward_decode(
+                hidden, gdn_states[i], self.layer_weights[i], kv_cache=past_kv
             )
             new_states.append(new_state)
+            new_kv_caches.append(new_kv)
 
         logits = self.lm_head(hidden[:, -1, :])  # [B, VOCAB/TP]
-        return logits, new_states
+        return logits, new_states, new_kv_caches
 
     def forward_prefill(
         self,
         input_ids: torch.Tensor,        # [total_tokens]
         cu_seqlens: torch.Tensor,       # [num_seqs+1] int64
         cache_prefix_len: int = 0,      # 缓存前缀长度（0=不缓存）
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Prefill forward with prefix cache support.
-
-        If cache_prefix_len > 0, will cache state at that position.
-        Automatically checks for cached prefix to skip computation.
-        """
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor] | None]]:
+        """Prefill forward. 返回 (logits, gdn_states, kv_caches)。"""
         device = input_ids.device
         total_tokens = len(input_ids)
 
@@ -108,26 +108,31 @@ class Qwen35Model:
             if len(suffix_ids) == 0:
                 hidden = cached_hidden
                 gdn_states = cached_gdn_states
+                kv_caches = [None] * len(self.layer_weights)
             else:
                 suffix_hidden = self.embed(suffix_ids.unsqueeze(0)).squeeze(0)
                 hidden = suffix_hidden
                 suffix_cu = torch.tensor([0, len(suffix_ids)], device=device, dtype=torch.int64)
                 gdn_states = []
+                kv_caches = []
                 for i in range(len(self.layer_weights)):
                     initial_state = cached_gdn_states[i] if cached_gdn_states[i] is not None else None
-                    hidden, final_state = layer_forward_prefill(
+                    hidden, final_state, new_kv = layer_forward_prefill(
                         hidden, suffix_cu, self.layer_weights[i],
                         initial_gdn_state=initial_state,
                     )
                     gdn_states.append(final_state)
+                    kv_caches.append(new_kv)
         else:
             hidden = self.embed(input_ids.unsqueeze(0)).squeeze(0)
             gdn_states = []
+            kv_caches = []
             for i in range(len(self.layer_weights)):
-                hidden, final_state = layer_forward_prefill(
+                hidden, final_state, new_kv = layer_forward_prefill(
                     hidden, cu_seqlens, self.layer_weights[i],
                 )
                 gdn_states.append(final_state)
+                kv_caches.append(new_kv)
 
             # Store to cache if requested
             if cache_prefix_len > 0 and cache_prefix_len <= total_tokens:
@@ -142,7 +147,40 @@ class Qwen35Model:
             last_positions = cu_seqlens[1:] - 1
             last_hidden = hidden[last_positions]
         logits = self.lm_head(last_hidden)
-        return logits, gdn_states
+
+        # Reshape attention KV cache from flat [total, H, D] to per-batch [B, S, H, D].
+        # Requires equal-length sequences (cu_seqlens with constant stride).
+        kv_caches = self._reshape_kv_caches_for_decode(kv_caches, cu_seqlens)
+
+        return logits, gdn_states, kv_caches
+
+    @staticmethod
+    def _reshape_kv_caches_for_decode(kv_caches, cu_seqlens):
+        """Convert flat-prefill KV → batched-decode KV [B, S, H, D]."""
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        B = seqlens.shape[0]
+        if B == 0:
+            return kv_caches
+        S = int(seqlens[0].item())
+        if not torch.all(seqlens == S).item():
+            raise NotImplementedError(
+                "KV cache decode only supports equal-length prefill sequences"
+            )
+        reshaped = []
+        for kv in kv_caches:
+            if kv is None:
+                reshaped.append(None)
+                continue
+            k, v = kv
+            # Handle both [total, H, D] and [total, 1, H, D] from _attn_forward
+            if k.dim() == 4 and k.shape[1] == 1:
+                k = k.squeeze(1)
+                v = v.squeeze(1)
+            H, D = k.shape[-2], k.shape[-1]
+            k_b = k.reshape(B, S, H, D).contiguous()
+            v_b = v.reshape(B, S, H, D).contiguous()
+            reshaped.append((k_b, v_b))
+        return reshaped
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """Greedy sampling from TP-sharded logits。返回 token ids [B]。"""

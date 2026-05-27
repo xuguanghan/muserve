@@ -100,7 +100,7 @@ class InferenceLoop:
         cu_seqlens = torch.tensor([0, len(input_ids)], device=self.device, dtype=torch.int64)
 
         # Prefill
-        logits, gdn_states = self.model.forward_prefill(
+        logits, gdn_states, kv_caches = self.model.forward_prefill(
             ids_tensor, cu_seqlens, cache_prefix_len=payload.cache_prefix_len,
         )
 
@@ -120,7 +120,7 @@ class InferenceLoop:
                 break
 
             decode_ids = next_token.view(1, 1)  # [B=1, 1]
-            logits, gdn_states = self.model.forward_decode(decode_ids, gdn_states)
+            logits, gdn_states, kv_caches = self.model.forward_decode(decode_ids, gdn_states, kv_caches=kv_caches)
             next_token = self.model.greedy_sample(logits)
             token_id = next_token.item()
 

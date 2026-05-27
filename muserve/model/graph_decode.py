@@ -85,7 +85,7 @@ class GraphedDecodeStep:
         hidden = self.model.embed(input_ids)  # [B, 1, HIDDEN]
 
         for i in range(len(self.model.layer_weights)):
-            hidden, _ = layer_forward_decode(
+            hidden, _, _ = layer_forward_decode(
                 hidden, gdn_states[i], self.model.layer_weights[i]
             )
 

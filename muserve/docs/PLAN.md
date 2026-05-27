@@ -532,6 +532,57 @@ muserve 当前使用的 mate 算子：gdn_decode, gdn_prefill, gemm_fp8_nt_group
 
 ---
 
+## TODO（2026-05-27）
+
+### P0：阻塞推理正确性
+- [ ] **修复 attention 层 decode 无 KV cache（根因，最高优先级）**
+  - 现象（`test_short2.log`，B=8, prompt='2+2='）：
+    - Prefill logits 正常：min=-5.59 max=4.59，无 NaN
+    - Decode 20 步全部生成 token 220（空格），形成 degenerate 不动点
+    - 之后 MCCL ALLGATHER/ALLREDUCE 全面崩溃（连锁反应，非根因）
+  - 根因定位（`qwen35_layer.py:_attn_forward` decode 分支，T=1）：
+    ```python
+    k_expanded = k_heads.repeat_interleave(...)  # 只来自当前 token 的 K
+    v_expanded = v_heads.repeat_interleave(...)  # 只来自当前 token 的 V
+    attn_out = v_expanded                         # softmax(scalar)=1，输出=当前 v
+    ```
+    16 层 standard attention（layers [0,3,7,11,15,19,23,27,31,35,39,43,47,51,55,59]）
+    每步都把上下文清零，只看见自己。GDN 44 层有 state 传递，attention 16 层完全缺失 KV cache。
+  - 修复方案（**先在不开 graph 的简单路径**验证正确性）：
+    1. `qwen35_model.py:forward_prefill` 末尾：每个 attention 层把完整 K、V 存入 `kv_caches: list[(K, V)]`（仅 16 层 attention 有，GDN 层占位 None），与 `gdn_states` 并列返回
+    2. `qwen35_model.py:forward_decode` 新增 `kv_caches` 参数：每个 attention 层 append 当前 K、V 到 cache，再做完整 GQA attention（用 cache 里的全部 K、V）
+    3. `qwen35_layer.py:_attn_forward` decode 分支接受 `(past_k, past_v)`，concat 当前 K、V 后做 GQA softmax attention（用 `F.softmax`，非 fmha）
+    4. `test_short_prompt.py`：移除 graph capture，直接调用 eager `forward_decode`，验证生成"4"或合理结果
+  - 接受标准：
+    - [ ] B=8 short prompt '2+2=' eager decode 输出包含 '4' 或合理回答
+    - [ ] decode logits 不再退化为单一 token 的不动点
+    - [ ] 不引入 MCCL 错误
+  - 后续（不在本任务范围）：graph capture 适配 — KV cache 用预分配 buffer + position 索引保持 Graph 静态性（P1）
+- [ ] **修复 eager B=1 decode 的 MoE GEMM crash**
+  - 现象：B=1 单请求 decode 在 `ragged_moe_gemm_8bit` 报 MUSA_ERROR_ILLEGAL_ADDRESS
+  - 已知 B=8 graph capture 正常（166 tok/s）
+  - 怀疑：B=1 时 expanded tokens 不满足 MoE GEMM 对齐要求
+- [ ] **InferenceLoop shutdown 修复**
+  - 现象：rank 0 设置 `_running=False` 后其他 rank 仍阻塞在 `broadcast_pyobj`
+  - 修复：rank 0 广播 "shutdown" 信号给所有 rank
+
+### P1：性能进一步优化（166 → 200+ tok/s）
+- [ ] mate kernel unsafe flags 上游修复（PR 到 mate 仓库）
+- [ ] moe_fused_gate 替换分离 gate（预计 +5-10%）
+- [ ] MUSA Graph multi-pool 减少 fragmentation
+
+### P2：场景验证
+- [ ] 32K TTFT 测试（FMHA 已替换 sdpa，验证 < 1.5s）
+- [ ] API 端到端推理正确性测试
+- [ ] 与 SGLang 参考实现 logits diff < 1e-2
+
+### P3：长远优化
+- [ ] gdn_mtp speculative decoding（1.5-2x）
+- [ ] fp8_mqa_logits + attention KV cache（attention decode 2x）
+- [ ] persistent kernel（300-420 tok/s）
+
+---
+
 ## 执行保障规则
 
 1. **每个 Task 开始前，先读验收标准** — 未达标 = 未完成

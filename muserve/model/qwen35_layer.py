@@ -189,9 +189,23 @@ def gdn_prefill_forward(
     k = k.reshape(total, -1, GDN_KEY_DIM).contiguous()
     v = v.reshape(total, -1, GDN_VALUE_DIM).contiguous()
 
+    # Compute alpha (g) and beta from hidden states (same as decode kernel)
+    # decode: x = a + dt_bias; softplus_x = softplus(x); g = -exp(A_log) * softplus_x
+    #         alpha = exp(g); beta = sigmoid(b_raw)
+    w_a = weights["gdn.in_proj_a.weight"]
+    w_b = weights["gdn.in_proj_b.weight"]
+    a_raw = bf16_linear(hidden, w_a).float()  # [total, num_v_heads_local]
+    b_raw = bf16_linear(hidden, w_b).float()
     num_v_heads_local = v.shape[1]
-    g = torch.ones(total, num_v_heads_local, dtype=torch.float32, device=hidden.device)
-    beta = torch.ones(total, num_v_heads_local, dtype=torch.float32, device=hidden.device)
+    rank = w_a.device.index or 0
+    A_log = weights["gdn.A_log"][rank * num_v_heads_local:(rank + 1) * num_v_heads_local].float()
+    dt_bias = weights["gdn.dt_bias"][rank * num_v_heads_local:(rank + 1) * num_v_heads_local].float()
+    x = a_raw + dt_bias  # [total, H]
+    softplus_x = F.softplus(x)
+    g_log = -torch.exp(A_log) * softplus_x  # [total, H]
+    g = torch.exp(g_log).contiguous()  # alpha in (0,1]
+    beta = torch.sigmoid(b_raw).contiguous()
+
     out, final_state = gdn_pre.chunk_gated_delta_rule(
         q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens,
         initial_state=initial_state, output_final_state=True,
@@ -219,8 +233,9 @@ _ATTN_GQA_RATIO = _ATTN_NUM_Q_HEADS // _ATTN_NUM_KV_HEADS  # 16
 def _attn_forward(
     hidden: torch.Tensor,   # [..., HIDDEN]
     weights: dict,
-) -> torch.Tensor:          # [..., HIDDEN]
-    """Standard GQA attention with output gate. Works for both prefill and decode."""
+    past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Standard GQA attention with output gate. Returns (output, updated_kv)."""
     orig_shape = hidden.shape
     if hidden.dim() == 3:
         B, T, H = hidden.shape
@@ -271,14 +286,33 @@ def _attn_forward(
         v_4d = v_heads.unsqueeze(0)   # [1, total, 2, 256]
         attn_out, _ = _fmha_fwd(q_4d, k_4d, v_4d, softmax_scale=scale, is_causal=True)
         attn_out = attn_out.squeeze(0)  # [total, 4, 256]
+        new_kv = (k_heads, v_heads)
     else:
-        # Decode (T=1): simple GQA matmul, graph-capture compatible
+        # Decode (T=1): GQA attention with KV cache
+        # past_kv shape: [B, past_len, num_kv_heads, head_dim] or None
+        # k_heads, v_heads: [B, num_kv_heads, head_dim]
+        k_cur = k_heads.unsqueeze(1)  # [B, 1, 2, 256]
+        v_cur = v_heads.unsqueeze(1)  # [B, 1, 2, 256]
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k_full = torch.cat([past_k, k_cur], dim=1)  # [B, past+1, 2, 256]
+            v_full = torch.cat([past_v, v_cur], dim=1)  # [B, past+1, 2, 256]
+        else:
+            k_full = k_cur
+            v_full = v_cur
+        new_kv = (k_full, v_full)
+        S = k_full.shape[1]
         local_gqa_ratio = _ATTN_Q_HEADS_LOCAL // _ATTN_NUM_KV_HEADS
-        k_expanded = k_heads.repeat_interleave(local_gqa_ratio, dim=1)
-        v_expanded = v_heads.repeat_interleave(local_gqa_ratio, dim=1)
-        # q,k,v: [B, heads, dim] → score = sum(q*k) * scale → softmax → * v
-        scores = (q_heads * k_expanded).sum(-1, keepdim=True) * scale
-        attn_out = v_expanded  # T=1: softmax(scalar)=1, output=v
+        k_exp = k_full.repeat_interleave(local_gqa_ratio, dim=2)  # [B, S, 4, 256]
+        v_exp = v_full.repeat_interleave(local_gqa_ratio, dim=2)  # [B, S, 4, 256]
+        # q_heads: [B, 4, 256] → [B, 4, 1, 256]
+        q_4d = q_heads.unsqueeze(2)
+        # k_exp: [B, S, 4, 256] → [B, 4, S, 256]
+        k_4d = k_exp.permute(0, 2, 1, 3)
+        scores = torch.matmul(q_4d, k_4d.transpose(-1, -2)) * scale  # [B, 4, 1, S]
+        attn_weights = F.softmax(scores, dim=-1)
+        v_4d = v_exp.permute(0, 2, 1, 3)  # [B, 4, S, 256]
+        attn_out = torch.matmul(attn_weights, v_4d).squeeze(2)  # [B, 4, 256]
     attn_flat = attn_out.reshape(total, -1)  # [total, local_q_dim=1024]
 
     # Apply output gate (sigmoid)
@@ -295,7 +329,7 @@ def _attn_forward(
     s_o = weights.get("attn.o_proj.weight_scale_inv")
     output = fp8_linear(gathered, w_o, s_o) if s_o is not None else bf16_linear(gathered, w_o)
 
-    return output.reshape(orig_shape)
+    return output.reshape(orig_shape), new_kv
 
 
 _FLAT_TOKEN_IDX_CACHE = {}
@@ -532,18 +566,20 @@ def layer_forward_decode(
     hidden: torch.Tensor,       # [B, 1, HIDDEN]
     gdn_state: torch.Tensor | None,
     weights: dict,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """单层 decode forward。自动检测 GDN 或 attention 层。"""
+    kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+    """单层 decode forward。返回 (hidden, gdn_state, kv_cache)。"""
     is_attn_layer = "attn.q_proj.weight" in weights
 
     # 1. Pre-norm + attention/GDN
     norm_w = weights["input_layernorm.weight"]
     x = rms_norm(hidden, norm_w)
 
+    new_kv = None
     if is_attn_layer:
-        attn_out = _attn_forward(x, weights)
+        attn_out, new_kv = _attn_forward(x, weights, past_kv=kv_cache)
         hidden = hidden + attn_out
-        new_state = gdn_state  # attention 层不更新 GDN state
+        new_state = gdn_state
     else:
         gdn_out, new_state = gdn_decode_forward(x, gdn_state, weights)
         hidden = hidden + gdn_out
@@ -560,7 +596,7 @@ def layer_forward_decode(
         moe_out = moe_forward(x, weights)
         hidden = hidden + moe_out
 
-    return hidden, new_state
+    return hidden, new_state, new_kv
 
 
 def layer_forward_prefill(
@@ -568,18 +604,21 @@ def layer_forward_prefill(
     cu_seqlens: torch.Tensor,   # [num_seqs+1] int64
     weights: dict,
     initial_gdn_state: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """单层 prefill forward。自动检测 GDN 或 attention 层。"""
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+    """单层 prefill forward。返回 (hidden, gdn_state, kv_cache)。"""
     is_attn_layer = "attn.q_proj.weight" in weights
 
     # 1. Pre-norm + attention/GDN
     norm_w = weights["input_layernorm.weight"]
     x = rms_norm(hidden, norm_w)
 
+    new_kv = None
     if is_attn_layer:
-        attn_out = _attn_forward(x, weights)
-        hidden = hidden + attn_out
-        final_state = initial_gdn_state  # attention 层不更新 GDN state
+        # Pass as 3D [1, total, HIDDEN] so _attn_forward uses FMHA (T > 1)
+        x_3d = x.unsqueeze(0)
+        attn_out, new_kv = _attn_forward(x_3d, weights)
+        hidden = hidden + attn_out.squeeze(0)
+        final_state = initial_gdn_state
     else:
         gdn_out, final_state = gdn_prefill_forward(x, cu_seqlens, weights, initial_gdn_state)
         hidden = hidden + gdn_out
@@ -590,4 +629,4 @@ def layer_forward_prefill(
     moe_out = moe_forward(x, weights)
     hidden = hidden + moe_out
 
-    return hidden, final_state
+    return hidden, final_state, new_kv
