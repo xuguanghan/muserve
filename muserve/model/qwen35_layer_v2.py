@@ -57,25 +57,15 @@ _ATTN_HEAD_DIM = HEAD_DIM                          # 256
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def rms_norm_gemma(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Gemma-style RMS norm: weight 存储相对于 1.0 的偏移。
-
-    对应 sglang `GemmaRMSNorm`: y = x * rsqrt(mean(x^2) + eps) * (1 + weight)
-    用于:
-      - input_layernorm / post_attention_layernorm (Qwen3.5 decoder layer)
-      - q_norm / k_norm (attention 层)
-    """
+    """Gemma-style RMS norm: weight 存储相对于 1.0 的偏移。"""
     w = (1.0 + weight.float()).to(x.dtype)
-    return F.rms_norm(x, (x.shape[-1],), w, eps)
+    return F.rms_norm(x, (x.shape[-1],), w, eps).to(x.dtype)
 
 
 def rms_norm_plain(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Plain RMS norm: weight 直接乘.
-
-    对应 sglang `RMSNormGated` 内部的 norm 部分（不含 gate）。
-    用于: GDN 输出的 per-head norm (norm.weight)
-    """
+    """Plain RMS norm: weight 直接乘."""
     w = weight if weight.dtype == x.dtype else weight.to(x.dtype)
-    return F.rms_norm(x, (x.shape[-1],), w, eps)
+    return F.rms_norm(x, (x.shape[-1],), w, eps).to(x.dtype)
 
 
 def _fast_fp8_quantize(x: torch.Tensor, block_size: int = 128) -> tuple:
@@ -184,30 +174,30 @@ def _gdn_conv1d_apply(qkv: torch.Tensor, conv_weight: torch.Tensor,
     """
     S, C = qkv.shape
     K = conv_weight.shape[-1]
+    orig_dtype = qkv.dtype
+
+    # F.conv1d on MUSA does not support bf16 — upcast to float32 for the op,
+    # then cast back to the original dtype afterwards.
+    qkv_f = qkv.float()
+    w_f = conv_weight.float()
 
     # [1, C, S]
-    qkv_t = qkv.transpose(0, 1).unsqueeze(0).contiguous()
+    qkv_t = qkv_f.transpose(0, 1).unsqueeze(0).contiguous()
 
     if conv_state is not None:
         # decode 路径：prepend conv_state（最近 K-1 个 token）
-        # conv_state: [C, K-1] → [1, C, K-1]
-        state_t = conv_state.unsqueeze(0)
+        state_t = conv_state.float().unsqueeze(0)
         padded = torch.cat([state_t, qkv_t], dim=-1)  # [1, C, K-1+S]
-        out = F.conv1d(padded, conv_weight, groups=C)  # [1, C, S]
-        # 更新 conv_state：保留最后 K-1 个 token (当前 token + 之前 K-2 个)
-        # padded[-K+1:] = padded[K-1+S - (K-1):] = padded[S:]
-        # 实际我们要保留最后 K-1 个 token 用于下一步 decode
-        # padded 形状 [1, C, K-1+S]，最后 K-1 个 = padded[:, :, -(K-1):]
-        new_conv_state = padded[0, :, -(K - 1):].contiguous()  # [C, K-1]
+        out = F.conv1d(padded, w_f, groups=C)          # [1, C, S]
+        new_conv_state = padded[0, :, -(K - 1):].to(orig_dtype).contiguous()
     else:
         # prefill 路径：causal left-pad K-1 个 0
-        padded = F.pad(qkv_t, (K - 1, 0))  # [1, C, S+K-1]
-        out = F.conv1d(padded, conv_weight, groups=C)  # [1, C, S]
-        # prefill 也可以返回 conv_state（最后 K-1 个 token），供后续 decode 使用
-        new_conv_state = padded[0, :, -(K - 1):].contiguous() if S >= K - 1 else None
+        padded = F.pad(qkv_t, (K - 1, 0))             # [1, C, S+K-1]
+        out = F.conv1d(padded, w_f, groups=C)          # [1, C, S]
+        new_conv_state = padded[0, :, -(K - 1):].to(orig_dtype).contiguous() if S >= K - 1 else None
 
     out = F.silu(out)
-    out = out.squeeze(0).transpose(0, 1).contiguous()  # [S, C]
+    out = out.squeeze(0).transpose(0, 1).to(orig_dtype).contiguous()  # [S, C], back to bf16
     return out, new_conv_state
 
 
@@ -425,10 +415,9 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> 
     dim_half = x.shape[-1] // 2
     x1 = x[..., :dim_half]
     x2 = x[..., dim_half:]
-    # cos/sin 需要 broadcast 到 x 的 shape
-    # x: [total, num_heads, head_dim] → cos/sin 需要 [total, 1, dim_half]
-    cos = cos.unsqueeze(-2)  # [total, 1, dim_half]
-    sin = sin.unsqueeze(-2)
+    # Cast cos/sin to x.dtype to avoid float32 promotion on MUSA
+    cos = cos.to(x.dtype).unsqueeze(-2)  # [total, 1, dim_half]
+    sin = sin.to(x.dtype).unsqueeze(-2)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
@@ -597,7 +586,7 @@ def moe_forward(hidden: torch.Tensor, weights: dict) -> torch.Tensor:
     # 4. Sort by expert ID for batched GEMM
     sort_order = local_expert_ids.argsort(stable=True)
     sorted_tokens = local_tokens[sort_order]
-    sorted_expert_ids = local_expert_ids[sort_order]
+    sorted_expert_ids = local_expert_ids[sort_order].to(torch.int32)  # ragged_m_moe_gemm_8bit requires int32
     inverse_order = sort_order.argsort()
 
     # 5. Batched FP8 GEMM (gate_up fused)
