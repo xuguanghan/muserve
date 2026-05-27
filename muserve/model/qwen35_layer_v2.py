@@ -79,43 +79,40 @@ def rms_norm_plain(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> 
 
 
 def _fast_fp8_quantize(x: torch.Tensor, block_size: int = 128) -> tuple:
-    """FP8 activation 量化 (per-block amax)。返回 (fp8_tensor, scale_inv)。"""
+    """FP8 activation 量化 (per-block amax)。返回 (fp8_tensor, x_scale)。
+
+    x_scale = amax/448 (per-block, [M, K//128]) — 同 v1 约定，直接传 gemm_fp8_nt_groupwise。
+    """
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1])
     M, K = x_2d.shape
     assert K % block_size == 0, f"K={K} not divisible by block_size={block_size}"
 
-    # Per-block amax (block on K dim)
     x_blocks = x_2d.view(M, K // block_size, block_size).float()
-    amax = x_blocks.abs().amax(dim=-1)  # [M, K//128]
-    scale = (amax / 448.0).clamp(min=1e-12)  # FP8 e4m3 max = 448
-    scale_inv = scale  # 已经是 amax/448
+    x_scale = x_blocks.abs().amax(dim=-1).clamp(min=1e-12) / 448.0  # [M, K//128]
 
-    x_scaled = (x_blocks / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
+    x_scaled = (x_blocks / x_scale.unsqueeze(-1)).clamp(-448.0, 448.0)
     x_fp8 = x_scaled.to(torch.float8_e4m3fn).view(M, K).contiguous()
-    return x_fp8, scale_inv.contiguous()
+    return x_fp8, x_scale.contiguous()
 
 
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
-    """FP8 GEMM: x [..., K] @ w [N, K] → [..., N], using mate.gemm.gemm_fp8_nt_groupwise.
+    """FP8 GEMM: x [..., K] @ w [N, K] → [..., N].
 
-    w_fp8: [N, K] fp8_e4m3
-    w_scale: [N//128, K//128] float32
+    w_fp8:  [N, K] fp8_e4m3
+    w_scale: [N//128, K//128] float32 (block-wise, amax/448 convention)
+    Mirrors v1 fp8_linear: gemm_fp8_nt_groupwise(x_fp8, w, x_scale, w_scale, ...)
     """
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1])
-    M, K = x_2d.shape
     N = w_fp8.shape[0]
 
-    # Quantize activation
     x_fp8, x_scale = _fast_fp8_quantize(x_2d)
 
-    # Allocate output (bf16 to match upstream)
-    out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    gemm_mod.gemm_fp8_nt_groupwise(
-        (x_fp8, x_scale),
-        (w_fp8, w_scale),
-        out,
+    out = gemm_mod.gemm_fp8_nt_groupwise(
+        x_fp8, w_fp8, x_scale, w_scale,
+        scale_granularity_mnk=(1, 128, 128),
+        out_dtype=torch.bfloat16,
     )
     return out.reshape(*orig_shape[:-1], N)
 
@@ -296,7 +293,7 @@ def gdn_decode_forward(
     dt_bias = weights["gdn.dt_bias"][rank * _GDN_V_HEADS_LOCAL:(rank + 1) * _GDN_V_HEADS_LOCAL]
 
     # mate decode kernel — supports GQA: HV % H == 0 ✓ (V_HEADS_LOCAL=8, K_HEADS_LOCAL=2, 4x ratio)
-    out, _ = gdn_dec.gated_delta_rule_decode(
+    out, new_state = gdn_dec.gated_delta_rule_decode(
         q=q4, k=k4, v=v4,
         state=state,
         A_log=A_log,
@@ -321,7 +318,7 @@ def gdn_decode_forward(
     out_proj = _gdn_allgather_and_out_proj(out_local, weights)  # [B, HIDDEN]
     out_proj = out_proj.reshape(B, 1, HIDDEN_SIZE) if hidden.dim() == 3 else out_proj
 
-    return out_proj, state, new_conv_state
+    return out_proj, new_state, new_conv_state
 
 
 def gdn_prefill_forward(
@@ -484,9 +481,11 @@ def attn_forward(
 
     scale = _ATTN_HEAD_DIM ** -0.5
 
-    # 4. Attention
-    if T > 1:
-        # Prefill: use mate FMHA
+    # 4. Attention — 用 past_kv 是否为 None 区分 prefill/decode，
+    #    不用 T>1，避免单 token prefill（T=1）走错 decode 路径。
+    is_prefill = (past_kv is None)
+    if is_prefill:
+        # Prefill: causal FMHA，支持 GQA（q:4 heads, k/v:2 heads）
         from mate.jit.attention.fmha import _fmha_fwd
         q_4d = q_heads.unsqueeze(0)   # [1, total, 4, 256]
         k_4d = k_heads.unsqueeze(0)   # [1, total, 2, 256]
@@ -498,20 +497,16 @@ def attn_forward(
         # Decode: GQA with KV cache
         k_cur = k_heads.unsqueeze(1)  # [B, 1, 2, 256]
         v_cur = v_heads.unsqueeze(1)
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k_full = torch.cat([past_k, k_cur], dim=1)
-            v_full = torch.cat([past_v, v_cur], dim=1)
-        else:
-            k_full = k_cur
-            v_full = v_cur
+        past_k, past_v = past_kv
+        k_full = torch.cat([past_k, k_cur], dim=1)
+        v_full = torch.cat([past_v, v_cur], dim=1)
         new_kv = (k_full, v_full)
         S = k_full.shape[1]
         local_gqa_ratio = _ATTN_Q_HEADS_LOCAL // _ATTN_KV_HEADS
         k_exp = k_full.repeat_interleave(local_gqa_ratio, dim=2)  # [B, S, 4, 256]
         v_exp = v_full.repeat_interleave(local_gqa_ratio, dim=2)
-        q_4d = q_heads.unsqueeze(2)  # [B, 4, 1, 256]
-        k_4d = k_exp.permute(0, 2, 1, 3)  # [B, 4, S, 256]
+        q_4d = q_heads.unsqueeze(2)           # [B, 4, 1, 256]
+        k_4d = k_exp.permute(0, 2, 1, 3)     # [B, 4, S, 256]
         scores = torch.matmul(q_4d, k_4d.transpose(-1, -2)) * scale
         attn_weights = F.softmax(scores, dim=-1)
         v_4d = v_exp.permute(0, 2, 1, 3)
@@ -546,6 +541,7 @@ def attn_forward(
 #   - 每卡只处理 expert_id % TP_SIZE == rank 的 experts
 
 _FLAT_TOKEN_IDX_CACHE = {}
+_FUSED_GATE_UP_CACHE = {}
 
 
 def _get_flat_token_idx(total: int, topk: int, device: torch.device) -> torch.Tensor:
@@ -553,6 +549,24 @@ def _get_flat_token_idx(total: int, topk: int, device: torch.device) -> torch.Te
     if key not in _FLAT_TOKEN_IDX_CACHE:
         _FLAT_TOKEN_IDX_CACHE[key] = torch.arange(total, device=device).repeat_interleave(topk)
     return _FLAT_TOKEN_IDX_CACHE[key]
+
+
+def _get_fused_gate_up(weights: dict) -> tuple:
+    """延迟融合 gate_proj + up_proj → gate_up_proj，结果缓存在 weights dict 中。"""
+    if "moe.experts.gate_up_proj.weight" in weights:
+        return weights["moe.experts.gate_up_proj.weight"], weights["moe.experts.gate_up_proj.weight_scale_inv"]
+    w_gate = weights["moe.experts.gate_proj.weight"]
+    w_up   = weights["moe.experts.up_proj.weight"]
+    s_gate = weights["moe.experts.gate_proj.weight_scale_inv"]
+    s_up   = weights["moe.experts.up_proj.weight_scale_inv"]
+    # [E, N, K] cat on dim=1 → [E, 2N, K]
+    fused_w = torch.cat([w_gate, w_up], dim=1)
+    fused_s = torch.cat([s_gate, s_up], dim=1)
+    weights["moe.experts.gate_up_proj.weight"] = fused_w
+    weights["moe.experts.gate_up_proj.weight_scale_inv"] = fused_s
+    del weights["moe.experts.gate_proj.weight"], weights["moe.experts.gate_proj.weight_scale_inv"]
+    del weights["moe.experts.up_proj.weight"],   weights["moe.experts.up_proj.weight_scale_inv"]
+    return fused_w, fused_s
 
 
 def moe_forward(hidden: torch.Tensor, weights: dict) -> torch.Tensor:
@@ -603,8 +617,7 @@ def moe_forward(hidden: torch.Tensor, weights: dict) -> torch.Tensor:
 
     if _USE_BATCHED_MOE:
         # gate_up fused: [num_experts_local, 2*MOE_INTERMEDIATE, HIDDEN]
-        w_gate_up = weights["moe.experts.gate_up_proj.weight"]
-        s_gate_up = weights["moe.experts.gate_up_proj.weight_scale_inv"]
+        w_gate_up, s_gate_up = _get_fused_gate_up(weights)
         gate_up_out = torch.empty(padded_m, 2 * MOE_INTERMEDIATE,
                                   dtype=torch.bfloat16, device=hidden.device)
         x_fp8, x_scale = _fast_fp8_quantize(sorted_tokens_padded)
@@ -616,9 +629,9 @@ def moe_forward(hidden: torch.Tensor, weights: dict) -> torch.Tensor:
         )
         gate_up_out = gate_up_out[:num_local]
 
-        # SiLU activation: gate * silu(up)
+        # SiLU activation: silu(gate) * up  (SwiGLU)
         gate_out = gate_up_out[:, :MOE_INTERMEDIATE]
-        up_out = gate_up_out[:, MOE_INTERMEDIATE:]
+        up_out   = gate_up_out[:, MOE_INTERMEDIATE:]
         activated = F.silu(gate_out) * up_out
 
         # Down projection
@@ -626,7 +639,6 @@ def moe_forward(hidden: torch.Tensor, weights: dict) -> torch.Tensor:
         s_down = weights["moe.experts.down_proj.weight_scale_inv"]
         down_out = torch.empty(padded_m, HIDDEN_SIZE,
                                dtype=torch.bfloat16, device=hidden.device)
-        # Re-sort activated for down GEMM (same expert order)
         if padded_m > num_local:
             activated_padded = torch.zeros(padded_m, MOE_INTERMEDIATE,
                                            dtype=activated.dtype, device=activated.device)
