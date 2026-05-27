@@ -38,10 +38,13 @@ if rank == 0:
 # Create inference loop
 loop = InferenceLoop(model, tokenizer=tokenizer)
 
-# Test prompt
+# Test prompt — disable thinking mode so output is direct answer, not <think>...</think>
 prompt = "What is 2+2? Answer in one word:"
 messages = [{"role": "user", "content": prompt}]
-text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+text = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True,
+    enable_thinking=False,
+)
 input_ids = tokenizer.encode(text)
 
 if rank == 0:
